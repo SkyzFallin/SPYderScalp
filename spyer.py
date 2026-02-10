@@ -1,5 +1,5 @@
 """
-SPYer - SPY Intraday Options Signal App
+SPYderScalp - SPY Intraday Options Signal App
 Cross-Platform (Windows & macOS)
 
 Multi-indicator signal quality scoring with economic calendar
@@ -27,6 +27,8 @@ from PyQt5.QtGui import QFont, QColor
 
 import matplotlib
 matplotlib.use("Qt5Agg")
+import warnings
+warnings.filterwarnings("ignore", message=".*tight_layout.*")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
@@ -805,7 +807,10 @@ class CandlestickWidget(FigureCanvas):
         self.ax_macd.set_xticks(x[::step])
         self.ax_macd.set_xticklabels(labels[::step], rotation=45, fontsize=6, color="#aaa")
 
-        self.fig.tight_layout(pad=0.5)
+        try:
+            self.fig.tight_layout(pad=0.5)
+        except Exception:
+            self.fig.subplots_adjust(left=0.08, right=0.97, top=0.97, bottom=0.08, hspace=0.08)
         self.draw()
 
 
@@ -813,10 +818,10 @@ class CandlestickWidget(FigureCanvas):
 # Main application window
 # ---------------------------------------------------------------------------
 
-class SPYerApp(QMainWindow):
+class SPYderScalpApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SPYer")
+        self.setWindowTitle("SPYderScalp")
         self.setGeometry(0, 0, 1366, 720)
         self.last_signal_time = None
         self.signal_cooldown = 300
@@ -836,7 +841,7 @@ class SPYerApp(QMainWindow):
         # Top bar
         top_bar = QHBoxLayout()
         top_bar.setSpacing(6)
-        title = QLabel("SPYer")
+        title = QLabel("SPYderScalp")
         title.setFont(QFont("Arial", 14, QFont.Bold))
         top_bar.addWidget(title)
 
@@ -1259,7 +1264,7 @@ class SPYerApp(QMainWindow):
         try:
             if desktop_notification:
                 desktop_notification.notify(
-                    title=f"SPYer {signal_type} {result['grade']}",
+                    title=f"SPYderScalp {signal_type} {result['grade']}",
                     message=f"Score {result['score']}/100\nSPY ${price:.2f}  VWAP ${vwap:.2f}\nHold {hold['hold_label']} -> exit {hold['exit_by']}",
                     timeout=10,
                 )
@@ -1636,7 +1641,7 @@ class OptionsValueScanner(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SPYer - Options Value Scanner")
+        self.setWindowTitle("SPYderScalp - Options Value Scanner")
         self.setGeometry(50, 50, 1050, 620)
         self._build_ui()
 
@@ -1887,7 +1892,7 @@ class OptionsValueScanner(QMainWindow):
 # ---------------------------------------------------------------------------
 def main():
     app = QApplication(sys.argv)
-    win = SPYerApp()
+    win = SPYderScalpApp()
     win.show()
     sys.exit(app.exec_())
 

@@ -1,14 +1,14 @@
-# SPYer v4.20.69
+# SPYderScalp v4.20.69
 
 <p align="center">
-  <img src="sf.jpg" width="200" alt="SPYer">
+  <img src="sf.jpg" width="200" alt="SPYderScalp">
 </p>
 
 **Built by: SkyzFallin**
 
 **Real-time SPY intraday options signal monitor with multi-indicator quality scoring, options value scanner, DTE recommendations, economic calendar awareness, and hold-time estimates.**
 
-SPYer watches SPY price action and alerts you when conditions line up for a potential 0-2 DTE options trade -- then tells you *how good* the signal is with a quality score from 0-100 and a letter grade (A+ to F), explains *why* it gave that rating in plain English, recommends *which DTE to trade* based on time of day and conditions, tells you *how long to hold* based on momentum and upcoming economic events, and can scan the options chain for *mispriced contracts*.
+SPYderScalp watches SPY price action and alerts you when conditions line up for a potential 0-2 DTE options trade -- then tells you *how good* the signal is with a quality score from 0-100 and a letter grade (A+ to F), explains *why* it gave that rating in plain English, recommends *which DTE to trade* based on time of day and conditions, tells you *how long to hold* based on momentum and upcoming economic events, and can scan the options chain for *mispriced contracts*.
 
 ![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
@@ -82,7 +82,7 @@ WHY THIS GRADE:
 
 ## DTE Recommender
 
-SPYer tells you whether to trade 0, 1, or 2 DTE options based on current conditions:
+SPYderScalp tells you whether to trade 0, 1, or 2 DTE options based on current conditions:
 
 | Factor | 0DTE Preferred | 1DTE Preferred | 2DTE Preferred |
 |--------|---------------|----------------|----------------|
@@ -160,8 +160,8 @@ The Calendar tab shows today's events with countdown timers and the next 14 days
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SPYer.git
-cd SPYer
+git clone https://github.com/YOUR_USERNAME/SPYderScalp.git
+cd SPYderScalp
 pip install -r requirements.txt
 ```
 
@@ -173,10 +173,23 @@ python spyer.py
 
 ### Windows One-Click Setup
 
-Just double-click **`SPYer.bat`** -- it handles everything:
+Just double-click **`SPYderScalp.bat`** -- it handles everything:
 - First run: finds Python, creates venv, installs deps, launches (~1 min)
 - After that: launches in seconds
 - Fully portable -- move the folder anywhere
+
+### macOS
+
+```bash
+git clone https://github.com/YOUR_USERNAME/SPYderScalp.git
+cd SPYderScalp
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python spyer.py
+```
+
+macOS uses the built-in `afplay` command for sound alerts (Glass.aiff). Timezone handling uses `zoneinfo` which is included in Python 3.9+ -- no extra dependencies needed beyond what's in requirements.txt.
 
 ---
 
@@ -212,10 +225,10 @@ All market-sensitive logic runs in **US Eastern Time** regardless of your local 
 ## Project Structure
 
 ```
-SPYer/
+SPYderScalp/
   spyer.py                  # Main app (signals, chart, calendar, scanner, UI)
   sf.jpg                    # App logo
-  SPYer.bat                 # Windows smart launcher (double-click to run)
+  SPYderScalp.bat           # Windows smart launcher (double-click to run)
   requirements.txt          # Python dependencies
   install_windows.ps1       # Windows PowerShell installer (alternative)
   LICENSE                   # MIT license

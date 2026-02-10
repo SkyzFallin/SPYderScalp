@@ -178,7 +178,15 @@ Just double-click **`SPYderScalp.bat`** -- it handles everything:
 - After that: launches in seconds
 - Fully portable -- move the folder anywhere
 
-### macOS
+### macOS One-Click Setup
+
+Double-click **`SPYderScalp.command`** -- same idea as the Windows launcher:
+- First run: finds Python 3.9+, creates venv, installs deps, launches (~1 min)
+- After that: launches in seconds and closes the Terminal window automatically
+
+> **Note:** On first run macOS may ask you to allow the script. Right-click -> Open if double-click is blocked by Gatekeeper.
+
+Or manually:
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/SPYderScalp.git
@@ -229,6 +237,7 @@ SPYderScalp/
   spyer.py                  # Main app (signals, chart, calendar, scanner, UI)
   sf.jpg                    # App logo
   SPYderScalp.bat           # Windows smart launcher (double-click to run)
+  SPYderScalp.command        # macOS smart launcher (double-click to run)
   requirements.txt          # Python dependencies
   install_windows.ps1       # Windows PowerShell installer (alternative)
   LICENSE                   # MIT license

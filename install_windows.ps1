@@ -64,7 +64,7 @@ Write-Info "Activating venv..."
 
 # --- Install dependencies ---
 Write-Info "Installing Python dependencies..."
-pip install --upgrade yfinance pandas numpy PyQt5 plyer
+pip install --upgrade yfinance pandas numpy PyQt5 matplotlib plyer pytz
 
 Write-Ok "Dependencies installed."
 

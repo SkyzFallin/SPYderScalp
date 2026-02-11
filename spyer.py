@@ -11,6 +11,11 @@ import platform
 import json
 import math
 import traceback
+import os
+import csv
+import gc
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, date, time
@@ -20,10 +25,10 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QTextEdit, QGroupBox, QGridLayout, QCheckBox,
     QProgressBar, QFrame, QComboBox, QSpinBox, QSplitter, QScrollArea,
     QTabWidget, QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QDoubleSpinBox,
+    QAbstractItemView, QDoubleSpinBox, QFileDialog, QToolTip, QStatusBar,
 )
-from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QFont, QColor, QCursor
 
 import matplotlib
 matplotlib.use("Qt5Agg")
@@ -51,12 +56,117 @@ except ImportError:
 
 # Platform-specific sound
 if platform.system() == "Darwin":
-    import os
+    pass  # os already imported
 elif platform.system() == "Windows":
     try:
         import winsound
     except ImportError:
         winsound = None
+
+
+# ---------------------------------------------------------------------------
+# Centralized Theme
+# ---------------------------------------------------------------------------
+
+THEME = {
+    "bg": "#1e1e1e", "bg_dark": "#1a1a2e", "bg_panel": "#1e1e36",
+    "border": "#333", "border_light": "#444",
+    "text": "#ccc", "text_dim": "#888", "text_muted": "#666", "text_label": "#aaa",
+    "green": "#26a69a", "red": "#ef5350", "yellow": "#ffab00",
+    "blue": "#42a5f5", "purple": "#ab47bc", "pink": "#e040fb", "orange": "#e65100",
+    "grade_ap": "#00c853", "grade_a": "#2e7d32", "grade_b": "#558b2f",
+    "grade_c": "#f9a825", "grade_d": "#e65100", "grade_f": "#c62828",
+    "btn_start": "background:#4CAF50;color:white;padding:4px 12px;border-radius:3px;",
+    "btn_stop": "background:#f44336;color:white;padding:4px 12px;border-radius:3px;",
+    "btn_scan": "background:#2196F3;color:white;padding:4px 12px;border-radius:3px;",
+    "btn_scanner": "background:#9C27B0;color:white;padding:4px 12px;border-radius:3px;",
+    "btn_small": "background:#555;color:white;padding:2px 8px;border-radius:2px;",
+    "btn_active_tf": "background:#2196F3;color:white;border-radius:2px;padding:1px 3px;",
+    "btn_inactive_tf": "background:#333;color:#aaa;border-radius:2px;padding:1px 3px;",
+    "tab_content": "background:#1a1a2e; color:#ccc; border:1px solid #333;",
+}
+
+
+# ---------------------------------------------------------------------------
+# Settings persistence
+# ---------------------------------------------------------------------------
+
+SETTINGS_FILE = Path.home() / ".spyderscalp_settings.json"
+
+
+def load_settings():
+    defaults = {
+        "min_grade": "C", "vol_threshold": 150, "show_calls": True,
+        "show_puts": True, "chart_tf": "1m", "show_auto_sr": True,
+        "show_bb": True, "show_vwap_bands": False, "alert_sound": True,
+        "splitter_sizes": [820, 540],
+    }
+    try:
+        if SETTINGS_FILE.exists():
+            with open(SETTINGS_FILE, "r") as f:
+                defaults.update(json.load(f))
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Rate-limited yfinance wrapper with retry/backoff
+# ---------------------------------------------------------------------------
+
+_yf_last_call = datetime.min
+_yf_backoff_until = datetime.min
+
+
+def yf_download_safe(ticker, **kwargs):
+    """Wrapper around yf.download with rate limiting and retry."""
+    global _yf_last_call, _yf_backoff_until
+    import time as _time
+
+    now = datetime.now()
+    if now < _yf_backoff_until:
+        return None
+
+    elapsed = (now - _yf_last_call).total_seconds()
+    if elapsed < 0.5:
+        _time.sleep(0.5 - elapsed)
+
+    kwargs.setdefault("progress", False)
+
+    for attempt in range(3):
+        try:
+            _yf_last_call = datetime.now()
+            df = yf.download(ticker, **kwargs)
+            if df is None or df.empty:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = (df.columns.droplevel("Ticker")
+                              if "Ticker" in df.columns.names
+                              else df.columns.get_level_values(0))
+            required = {"Open", "High", "Low", "Close", "Volume"}
+            if not required.issubset(set(df.columns)):
+                return None
+            df = df.dropna(subset=["Open", "High", "Low", "Close"])
+            return df if len(df) >= 2 else None
+        except Exception as e:
+            err_str = str(e).lower()
+            if "rate" in err_str or "429" in err_str or "too many" in err_str:
+                backoff = 5 * (attempt + 1)
+                _yf_backoff_until = datetime.now() + timedelta(seconds=backoff)
+                _time.sleep(backoff)
+            elif attempt < 2:
+                _time.sleep(1)
+            else:
+                return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +218,178 @@ def compute_macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int 
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
+
+
+def compute_bollinger_bands(series: pd.Series, period: int = 20, std_dev: float = 2.0):
+    """Compute Bollinger Bands. Returns (upper, middle, lower, bandwidth, pct_b)."""
+    middle = series.rolling(window=period, min_periods=period).mean()
+    rolling_std = series.rolling(window=period, min_periods=period).std()
+    upper = middle + std_dev * rolling_std
+    lower = middle - std_dev * rolling_std
+    bandwidth = ((upper - lower) / middle * 100).fillna(0)
+    pct_b = ((series - lower) / (upper - lower)).fillna(0.5)
+    return upper, middle, lower, bandwidth, pct_b
+
+
+def compute_vwap_bands(df, std_mult=1.0):
+    """Compute VWAP with standard deviation bands."""
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    cumvol = df["Volume"].cumsum()
+    cumvol_tp = (tp * df["Volume"]).cumsum()
+    vwap = cumvol_tp / cumvol
+    vwap_diff = tp - vwap
+    vwap_diff_sq = (vwap_diff ** 2 * df["Volume"]).cumsum()
+    vwap_std = np.sqrt(vwap_diff_sq / cumvol)
+    return vwap, vwap + vwap_std, vwap - vwap_std, vwap + vwap_std * 2, vwap - vwap_std * 2
+
+
+def detect_rsi_divergence(close: pd.Series, rsi: pd.Series, lookback: int = 20):
+    """
+    Detect RSI divergence. Returns (type, strength) where type is
+    'bullish', 'bearish', or None.
+    """
+    if len(close) < lookback or len(rsi) < lookback:
+        return None, 0
+    price_vals = close.iloc[-lookback:].values
+    rsi_vals = rsi.iloc[-lookback:].values
+    if np.any(np.isnan(rsi_vals)):
+        return None, 0
+
+    half = lookback // 2
+    # Bullish: price lower low + RSI higher low
+    price_low1, price_low2 = np.min(price_vals[:half]), np.min(price_vals[half:])
+    rsi_low1, rsi_low2 = np.min(rsi_vals[:half]), np.min(rsi_vals[half:])
+    if price_low2 < price_low1 and rsi_low2 > rsi_low1:
+        strength = (rsi_low2 - rsi_low1) / max(abs(rsi_low1), 1)
+        return "bullish", min(strength, 1.0)
+
+    # Bearish: price higher high + RSI lower high
+    price_high1, price_high2 = np.max(price_vals[:half]), np.max(price_vals[half:])
+    rsi_high1, rsi_high2 = np.max(rsi_vals[:half]), np.max(rsi_vals[half:])
+    if price_high2 > price_high1 and rsi_high2 < rsi_high1:
+        strength = (rsi_high1 - rsi_high2) / max(abs(rsi_high1), 1)
+        return "bearish", min(strength, 1.0)
+
+    return None, 0
+
+
+def detect_candle_patterns(df, lookback=3):
+    """Detect candlestick patterns. Returns list of (name, bias, strength)."""
+    patterns = []
+    if len(df) < lookback + 1:
+        return patterns
+
+    data = df.iloc[-(lookback + 1):]
+    opens, closes = data["Open"].values, data["Close"].values
+    highs, lows = data["High"].values, data["Low"].values
+
+    o, c, h, l = opens[-1], closes[-1], highs[-1], lows[-1]
+    body = abs(c - o)
+    total_range = h - l if h != l else 0.001
+    body_ratio = body / total_range
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    po, pc = opens[-2], closes[-2]
+    pbody = abs(pc - po)
+    ptotal_range = highs[-2] - lows[-2] if highs[-2] != lows[-2] else 0.001
+
+    # Hammer
+    if lower_wick > body * 2 and upper_wick < body * 0.5 and body_ratio < 0.35:
+        patterns.append(("Hammer", "bullish", 0.7))
+    # Shooting Star
+    if upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.35:
+        patterns.append(("Shooting Star", "bearish", 0.7))
+    # Doji
+    if body_ratio < 0.1 and total_range > 0:
+        patterns.append(("Doji", "neutral", 0.5))
+    # Bullish Engulfing
+    if c > o and pc < po and c > po and o < pc:
+        patterns.append(("Bullish Engulfing", "bullish", 0.85))
+    # Bearish Engulfing
+    if c < o and pc > po and c < po and o > pc:
+        patterns.append(("Bearish Engulfing", "bearish", 0.85))
+
+    # 3-candle patterns
+    if len(data) >= 3:
+        o2, c2 = opens[-3], closes[-3]
+        body2 = abs(c2 - o2)
+        # Morning Star
+        if c2 < o2 and body2 > ptotal_range * 0.3 and pbody < body2 * 0.3 and c > o and body > body2 * 0.5:
+            patterns.append(("Morning Star", "bullish", 0.9))
+        # Evening Star
+        if c2 > o2 and body2 > ptotal_range * 0.3 and pbody < body2 * 0.3 and c < o and body > body2 * 0.5:
+            patterns.append(("Evening Star", "bearish", 0.9))
+        # Three White Soldiers / Three Black Crows
+        if all(closes[-(i+1)] > opens[-(i+1)] for i in range(3)) and closes[-1] > closes[-2] > closes[-3]:
+            patterns.append(("Three White Soldiers", "bullish", 0.8))
+        if all(closes[-(i+1)] < opens[-(i+1)] for i in range(3)) and closes[-1] < closes[-2] < closes[-3]:
+            patterns.append(("Three Black Crows", "bearish", 0.8))
+
+    return patterns
+
+
+def detect_bb_squeeze(bandwidth: pd.Series, lookback: int = 20, squeeze_pctile: float = 20):
+    """Detect Bollinger Band squeeze. Returns (is_squeeze, intensity 0-1)."""
+    if len(bandwidth) < lookback:
+        return False, 0
+    recent_bw = bandwidth.iloc[-lookback:]
+    current_bw = float(bandwidth.iloc[-1])
+    if np.isnan(current_bw):
+        return False, 0
+    percentile = (recent_bw < current_bw).sum() / len(recent_bw) * 100
+    is_squeeze = percentile < squeeze_pctile
+    intensity = max(0, 1.0 - percentile / squeeze_pctile) if is_squeeze else 0
+    return is_squeeze, intensity
+
+
+# ---------------------------------------------------------------------------
+# Threaded data fetchers (eliminate UI freezes)
+# ---------------------------------------------------------------------------
+
+class DataFetchWorker(QThread):
+    """Fetch market data in a background thread."""
+    finished = pyqtSignal(object, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, strategies=None):
+        super().__init__()
+        self.strategies = strategies or [
+            {"period": "1d", "interval": "1m", "label": "live"},
+            {"period": "5d", "interval": "5m", "label": "delayed"},
+            {"period": "5d", "interval": "1d", "label": "daily"},
+        ]
+
+    def run(self):
+        for strat in self.strategies:
+            df = yf_download_safe("SPY", period=strat["period"], interval=strat["interval"])
+            if df is not None and len(df) >= (15 if strat["label"] != "daily" else 2):
+                self.finished.emit(df, strat["label"])
+                return
+        self.error.emit("Could not fetch data from any source")
+
+
+class MTFDataFetchWorker(QThread):
+    """Fetch 5m and 15m data for multi-timeframe analysis."""
+    finished = pyqtSignal(object, object)
+
+    def run(self):
+        df_5m = yf_download_safe("SPY", period="5d", interval="5m")
+        if df_5m is not None and len(df_5m) < 10:
+            df_5m = None
+        df_15m = yf_download_safe("SPY", period="5d", interval="15m")
+        if df_15m is not None and len(df_15m) < 10:
+            df_15m = None
+        self.finished.emit(df_5m, df_15m)
+
+
+class SwingFetchWorker(QThread):
+    """Fetch historical daily data for swing prediction in background."""
+    finished = pyqtSignal(object)
+
+    def run(self):
+        df = yf_download_safe("SPY", period="3mo", interval="1d")
+        self.finished.emit(df)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +630,7 @@ def get_event_context(et_now):
 
 def estimate_hold_time(signal_type, score, dte, vol_ratio, rsi, event_ctx):
     et_now = now_et()
+    time_decimal = et_now.hour + et_now.minute / 60.0
     reasons = []
 
     if dte == 0:
@@ -388,6 +671,19 @@ def estimate_hold_time(signal_type, score, dte, vol_ratio, rsi, event_ctx):
     elif signal_type == "PUT" and rsi < 28:
         base = int(base * 0.6)
         reasons.append(f"RSI {rsi:.0f} oversold -> bounce risk")
+
+    # Shorten hold times in afternoon regardless - moves are less reliable
+    if time_decimal >= 14.5:
+        base = int(base * 0.7)
+        reasons.append(f"Late session -> shortened to {base} min (less follow-through)")
+    elif time_decimal >= 13.0:
+        base = int(base * 0.85)
+        reasons.append(f"Afternoon -> slightly shortened to {base} min")
+
+    # Lunch hour (11:30-1:00) - low liquidity, moves are choppy
+    if 11.5 <= time_decimal < 13.0:
+        base = int(base * 0.8)
+        reasons.append(f"Lunch chop zone -> shortened to {base} min")
 
     nearest = event_ctx.get("nearest_event")
     mins_to = event_ctx.get("minutes_to_nearest")
@@ -460,7 +756,7 @@ def estimate_hold_time(signal_type, score, dte, vol_ratio, rsi, event_ctx):
 # DTE Recommender - suggests 0, 1, or 2 DTE
 # ---------------------------------------------------------------------------
 
-def recommend_dte(signal_score, signal_grade, vol_ratio, rsi, event_ctx):
+def recommend_dte(signal_score, signal_grade, vol_ratio, rsi, event_ctx, mtf_multiplier=1.0):
     """
     Recommend which DTE to trade based on market conditions.
     Returns dict with recommended_dte, reasoning, and alt options.
@@ -476,28 +772,37 @@ def recommend_dte(signal_score, signal_grade, vol_ratio, rsi, event_ctx):
     if time_decimal < 10.5:  # Before 10:30 AM ET
         dte_scores[0] += 30
         reasons.append("Early session -> 0DTE has max theta burn ahead")
-    elif time_decimal < 13.0:  # 10:30 AM - 1:00 PM ET
+    elif time_decimal < 12.0:  # 10:30 AM - 12:00 PM ET
         dte_scores[0] += 15
         dte_scores[1] += 10
-        reasons.append("Mid-morning -> 0DTE still good, 1DTE safer for lunch chop")
-    elif time_decimal < 14.5:  # 1:00 - 2:30 PM ET
-        dte_scores[0] -= 10
-        dte_scores[1] += 25
-        reasons.append("Afternoon -> 1DTE preferred, 0DTE theta accelerating against you")
-    elif time_decimal < 15.5:  # 2:30 - 3:30 PM ET
+        reasons.append("Late morning -> 0DTE still viable, 1DTE safer after lunch")
+    elif time_decimal < 13.0:  # 12:00 - 1:00 PM ET
         dte_scores[0] -= 20
-        dte_scores[1] += 20
-        reasons.append("Late afternoon -> 0DTE risky (fast decay), prefer 1DTE")
-    else:  # After 3:30 PM ET
-        dte_scores[0] -= 40
         dte_scores[1] += 30
-        dte_scores[2] += 10
-        reasons.append("Power hour -> 0DTE very risky, 1DTE to carry overnight if conviction")
+        reasons.append("Noon -> shifting to 1DTE, 0DTE decay accelerating")
+    elif time_decimal < 14.0:  # 1:00 - 2:00 PM ET
+        dte_scores[0] -= 40
+        dte_scores[1] += 35
+        reasons.append("Early afternoon -> 1DTE strongly preferred, 0DTE too risky")
+    elif time_decimal < 15.0:  # 2:00 - 3:00 PM ET
+        dte_scores[0] -= 60
+        dte_scores[1] += 40
+        reasons.append("Late afternoon -> 1DTE only, 0DTE is a coin flip at this point")
+    else:  # After 3:00 PM ET
+        dte_scores[0] -= 100  # hard kill 0DTE
+        dte_scores[1] += 50
+        dte_scores[2] += 15
+        reasons.append("Final hour -> 1DTE required, 0DTE is gambling not trading")
 
     # --- Signal strength ---
+    # After noon, even strong signals shouldn't override 1DTE preference
     if signal_grade in ("A+", "A"):
-        dte_scores[0] += 20
-        reasons.append(f"Strong signal ({signal_grade}) -> 0DTE to maximize leverage")
+        if time_decimal < 12.0:
+            dte_scores[0] += 20
+            reasons.append(f"Strong signal ({signal_grade}) -> 0DTE to maximize leverage")
+        else:
+            dte_scores[1] += 15
+            reasons.append(f"Strong signal ({signal_grade}) -> good for 1DTE, too late for 0DTE")
     elif signal_grade == "B":
         dte_scores[0] += 5
         dte_scores[1] += 10
@@ -546,9 +851,28 @@ def recommend_dte(signal_score, signal_grade, vol_ratio, rsi, event_ctx):
     # --- Day of week ---
     dow = et_now.weekday()
     if dow == 4:  # Friday
+        dte_scores[0] -= 20  # 0DTE on Friday is already riskier
         if time_decimal > 12:
+            dte_scores[0] -= 30  # Friday afternoon 0DTE = no
+            dte_scores[1] += 15
+            reasons.append("Friday afternoon -> 0DTE expires today, 1DTE carries to Monday")
+        elif time_decimal > 10.5:
             dte_scores[0] -= 10
-            reasons.append("Friday afternoon -> 0DTE expires today, less room for error")
+            reasons.append("Friday midday -> 0DTE window shrinking fast")
+
+    # --- Multi-timeframe confirmation ---
+    if mtf_multiplier < 0.75:
+        dte_scores[0] -= 30
+        dte_scores[1] += 15
+        dte_scores[2] += 10
+        reasons.append("Higher TFs conflict -> 0DTE too risky without trend support, prefer 1-2DTE")
+    elif mtf_multiplier < 0.90:
+        dte_scores[0] -= 15
+        dte_scores[1] += 10
+        reasons.append("Higher TFs partially conflict -> lean toward 1DTE for safety")
+    elif mtf_multiplier > 1.05:
+        dte_scores[0] += 10
+        reasons.append("Higher TFs confirm -> 0DTE viable with trend support")
 
     # Pick winner
     best_dte = max(dte_scores, key=dte_scores.get)
@@ -592,85 +916,302 @@ def score_to_grade(score):
 
 def grade_color(grade):
     return {
-        "A+": "#00c853", "A": "#2e7d32", "B": "#558b2f",
-        "C": "#f9a825", "D": "#e65100", "F": "#c62828",
-    }.get(grade, "#888888")
+        "A+": THEME["grade_ap"], "A": THEME["grade_a"], "B": THEME["grade_b"],
+        "C": THEME["grade_c"], "D": THEME["grade_d"], "F": THEME["grade_f"],
+    }.get(grade, THEME["text_dim"])
+
+
+# ---------------------------------------------------------------------------
+# Multi-Timeframe (MTF) confirmation layer
+# ---------------------------------------------------------------------------
+
+def analyze_timeframe(df, signal_type):
+    """
+    Analyze a single timeframe's agreement with the proposed signal.
+    Returns a dict with direction cues from that timeframe.
+    """
+    if df is None or df.empty or len(df) < 5:
+        return None
+
+    close = df["Close"]
+    current_price = float(close.iloc[-1])
+
+    # VWAP direction (if available)
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    vwap = float((tp * df["Volume"]).cumsum().iloc[-1] / df["Volume"].cumsum().iloc[-1])
+    price_vs_vwap = "above" if current_price > vwap else "below"
+
+    # EMA trend
+    ema9 = compute_ema(close, 9)
+    ema21 = compute_ema(close, 21)
+    ema9_val = float(ema9.iloc[-1])
+    ema21_val = float(ema21.iloc[-1])
+    ema_bullish = ema9_val > ema21_val
+
+    # EMA slope (is ema9 rising or falling?)
+    if len(ema9) >= 3:
+        ema9_slope = float(ema9.iloc[-1]) - float(ema9.iloc[-3])
+    else:
+        ema9_slope = 0
+
+    # MACD
+    macd_l, macd_s, macd_h = compute_macd(close)
+    macd_hist = float(macd_h.iloc[-1])
+    macd_bullish = macd_hist > 0
+
+    # Last candle direction
+    last_open = float(df["Open"].iloc[-1])
+    last_close = float(df["Close"].iloc[-1])
+    last_candle_green = last_close > last_open
+
+    # RSI
+    rsi_series = compute_rsi(close)
+    rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50
+
+    # How many cues agree with the signal?
+    if signal_type == "CALL":
+        agrees = sum([
+            price_vs_vwap == "above",
+            ema_bullish,
+            ema9_slope > 0,
+            macd_bullish,
+            last_candle_green,
+            50 < rsi < 70,  # healthy bullish range
+        ])
+        conflicts = sum([
+            price_vs_vwap == "below",
+            not ema_bullish,
+            ema9_slope < 0,
+            not macd_bullish,
+            not last_candle_green,
+            rsi < 40,  # bearish momentum
+        ])
+    else:  # PUT
+        agrees = sum([
+            price_vs_vwap == "below",
+            not ema_bullish,
+            ema9_slope < 0,
+            not macd_bullish,
+            not last_candle_green,
+            30 < rsi < 50,  # healthy bearish range
+        ])
+        conflicts = sum([
+            price_vs_vwap == "above",
+            ema_bullish,
+            ema9_slope > 0,
+            macd_bullish,
+            last_candle_green,
+            rsi > 60,  # bullish momentum
+        ])
+
+    return {
+        "agrees": agrees,
+        "conflicts": conflicts,
+        "total_cues": 6,
+        "vwap": price_vs_vwap,
+        "ema_bullish": ema_bullish,
+        "ema9_slope": ema9_slope,
+        "macd_bullish": macd_bullish,
+        "macd_hist": macd_hist,
+        "candle_green": last_candle_green,
+        "rsi": rsi,
+    }
+
+
+def compute_mtf_confirmation(signal_type, df_5m, df_15m):
+    """
+    Compute a multi-timeframe confirmation multiplier.
+    Returns (multiplier, reasoning_list) where multiplier is 0.6 - 1.15.
+    
+    Logic:
+    - Both timeframes strongly agree: 1.15x boost
+    - Both agree: 1.05x mild boost
+    - Mixed (one agrees, one neutral): 1.0x no change
+    - One conflicts: 0.85x penalty
+    - Both conflict: 0.65x heavy penalty
+    """
+    analysis_5m = analyze_timeframe(df_5m, signal_type)
+    analysis_15m = analyze_timeframe(df_15m, signal_type)
+
+    reasons = []
+    multiplier = 1.0
+
+    if analysis_5m is None and analysis_15m is None:
+        return 1.0, ["MTF data unavailable - no adjustment"], None
+
+    results = {}
+
+    # Score each timeframe: agrees/total -> ratio
+    for label, analysis in [("5m", analysis_5m), ("15m", analysis_15m)]:
+        if analysis is None:
+            results[label] = "unavailable"
+            continue
+        agree_ratio = analysis["agrees"] / analysis["total_cues"]
+        conflict_ratio = analysis["conflicts"] / analysis["total_cues"]
+
+        if agree_ratio >= 0.65:
+            results[label] = "confirming"
+            direction = "bullish" if signal_type == "CALL" else "bearish"
+            reasons.append(f"{label}: {analysis['agrees']}/{analysis['total_cues']} cues {direction} (confirming)")
+        elif conflict_ratio >= 0.50:
+            results[label] = "conflicting"
+            direction = "bullish" if signal_type == "PUT" else "bearish"
+            reasons.append(f"{label}: {analysis['conflicts']}/{analysis['total_cues']} cues {direction} (CONFLICTING)")
+        else:
+            results[label] = "neutral"
+            reasons.append(f"{label}: mixed signals ({analysis['agrees']} agree, {analysis['conflicts']} conflict)")
+
+    # Compute multiplier based on combined result
+    confirms = sum(1 for v in results.values() if v == "confirming")
+    conflicts = sum(1 for v in results.values() if v == "conflicting")
+    neutrals = sum(1 for v in results.values() if v == "neutral")
+
+    if confirms == 2:
+        multiplier = 1.15
+        reasons.append("=> Both 5m+15m confirm: +15% score boost")
+    elif confirms == 1 and conflicts == 0:
+        multiplier = 1.05
+        reasons.append("=> One TF confirms, none conflict: +5% boost")
+    elif conflicts == 0:
+        multiplier = 1.0
+        reasons.append("=> Mixed/neutral higher TFs: no adjustment")
+    elif conflicts == 1 and confirms == 0:
+        multiplier = 0.85
+        reasons.append("=> One TF conflicts: -15% score penalty")
+    elif conflicts == 1 and confirms == 1:
+        multiplier = 0.92
+        reasons.append("=> TFs disagree with each other: -8% penalty")
+    elif conflicts == 2:
+        multiplier = 0.65
+        reasons.append("=> Both 5m+15m conflict: -35% heavy penalty")
+
+    mtf_detail = {
+        "5m": analysis_5m,
+        "15m": analysis_15m,
+        "results": results,
+        "multiplier": multiplier,
+    }
+
+    return multiplier, reasons, mtf_detail
 
 
 def evaluate_signal(df, signal_type, event_ctx=None):
     breakdown = {}
     weights = {
-        "vwap": 20, "volume": 18, "rsi": 12, "ema_trend": 18,
-        "range_position": 8, "momentum": 8, "event_timing": 16,
+        "vwap": 15, "volume": 14, "rsi": 8, "ema_trend": 13,
+        "range_position": 5, "momentum": 6, "event_timing": 12,
+        "macd_confirm": 7, "trend_alignment": 4,
+        "rsi_divergence": 6, "bb_squeeze": 5, "candle_pattern": 5,
     }
     raw_scores = {}
 
     close = df["Close"]
-    current_price = close.iloc[-1]
-    current_vwap = df["VWAP"].iloc[-1]
+    current_price = float(close.iloc[-1])
+    current_vwap = float(df["VWAP"].iloc[-1])
 
-    # 1. VWAP distance
+    # 1. VWAP distance - require meaningful break, not just 1 cent over
     vwap_diff_pct = (current_price - current_vwap) / current_vwap * 100
     if signal_type == "CALL":
         raw_scores["vwap"] = np.clip(vwap_diff_pct / 0.30, 0, 1)
     else:
         raw_scores["vwap"] = np.clip(-vwap_diff_pct / 0.30, 0, 1)
+    # Penalty for being too close to VWAP (likely to reverse)
+    if abs(vwap_diff_pct) < 0.03:
+        raw_scores["vwap"] *= 0.3
     breakdown["vwap"] = f"Price {vwap_diff_pct:+.3f}% from VWAP"
 
-    # 2. Volume
-    avg_vol = df["Volume"].iloc[-21:-1].mean() if len(df) > 21 else df["Volume"].mean()
-    vol_ratio = df["Volume"].iloc[-1] / avg_vol if avg_vol > 0 else 0
+    # 2. Volume (use last completed bar, not the still-forming one)
+    if len(df) > 22:
+        last_vol = float(df["Volume"].iloc[-2])
+        avg_vol = float(df["Volume"].iloc[-22:-2].mean())
+    elif len(df) > 3:
+        last_vol = float(df["Volume"].iloc[-2])
+        avg_vol = float(df["Volume"].iloc[:-2].mean())
+    else:
+        last_vol = float(df["Volume"].iloc[-1])
+        avg_vol = float(df["Volume"].mean())
+    vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0
     raw_scores["volume"] = np.clip((vol_ratio - 1.0) / 2.0, 0, 1)
     breakdown["volume"] = f"Volume {vol_ratio:.2f}x avg"
 
-    # 3. RSI
-    rsi_series = compute_rsi(close)
-    rsi = rsi_series.iloc[-1] if not pd.isna(rsi_series.iloc[-1]) else 50
-    if signal_type == "CALL":
-        if 50 <= rsi <= 70:
-            raw_scores["rsi"] = 1.0 - abs(rsi - 60) / 20
-        elif rsi > 70:
-            raw_scores["rsi"] = max(0, 1.0 - (rsi - 70) / 20)
-        else:
-            raw_scores["rsi"] = max(0, (rsi - 30) / 20)
+    # 3. RSI - penalize signals fighting the momentum
+    if "_rsi" in df.columns:
+        rsi = float(df["_rsi"].iloc[-1]) if not pd.isna(df["_rsi"].iloc[-1]) else 50
     else:
-        if 30 <= rsi <= 50:
-            raw_scores["rsi"] = 1.0 - abs(rsi - 40) / 20
-        elif rsi < 30:
-            raw_scores["rsi"] = max(0, 1.0 - (30 - rsi) / 20)
+        rsi_series = compute_rsi(close)
+        rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50
+    if signal_type == "CALL":
+        if 50 <= rsi <= 68:
+            raw_scores["rsi"] = 1.0 - abs(rsi - 58) / 20
+        elif rsi > 68:
+            raw_scores["rsi"] = max(0, 1.0 - (rsi - 68) / 15)  # stricter overbought penalty
+        elif rsi < 40:
+            raw_scores["rsi"] = 0  # CALL when RSI is bearish = bad
         else:
-            raw_scores["rsi"] = max(0, (70 - rsi) / 20)
+            raw_scores["rsi"] = max(0, (rsi - 30) / 30)
+    else:
+        if 32 <= rsi <= 50:
+            raw_scores["rsi"] = 1.0 - abs(rsi - 42) / 20
+        elif rsi < 32:
+            raw_scores["rsi"] = max(0, 1.0 - (32 - rsi) / 15)  # stricter oversold penalty
+        elif rsi > 60:
+            raw_scores["rsi"] = 0  # PUT when RSI is bullish = bad
+        else:
+            raw_scores["rsi"] = max(0, (70 - rsi) / 30)
     breakdown["rsi"] = f"RSI {rsi:.1f}"
 
-    # 4. EMA trend
-    ema9 = compute_ema(close, 9)
-    ema21 = compute_ema(close, 21)
-    ema_diff = (ema9.iloc[-1] - ema21.iloc[-1]) / ema21.iloc[-1] * 100
+    # 4. EMA trend - also check if EMA9 crossed EMA21 recently
+    if "_ema9" in df.columns:
+        ema9 = df["_ema9"]
+        ema21 = df["_ema21"]
+    else:
+        ema9 = compute_ema(close, 9)
+        ema21 = compute_ema(close, 21)
+    ema_diff = (float(ema9.iloc[-1]) - float(ema21.iloc[-1])) / float(ema21.iloc[-1]) * 100
     if signal_type == "CALL":
         raw_scores["ema_trend"] = np.clip(ema_diff / 0.15, 0, 1)
     else:
         raw_scores["ema_trend"] = np.clip(-ema_diff / 0.15, 0, 1)
+    # Penalize if EMAs are pointing the wrong way
+    if len(ema9) >= 3:
+        ema9_slope = float(ema9.iloc[-1]) - float(ema9.iloc[-3])
+        if signal_type == "CALL" and ema9_slope < 0:
+            raw_scores["ema_trend"] *= 0.5
+        elif signal_type == "PUT" and ema9_slope > 0:
+            raw_scores["ema_trend"] *= 0.5
     breakdown["ema_trend"] = f"EMA9-EMA21 gap {ema_diff:+.3f}%"
 
-    # 5. Range position
-    day_high = df["High"].max()
-    day_low = df["Low"].min()
+    # 5. Range position - penalize chasing at extremes
+    day_high = float(df["High"].max())
+    day_low = float(df["Low"].min())
     day_range = day_high - day_low if day_high != day_low else 1
     range_pct = (current_price - day_low) / day_range
     if signal_type == "CALL":
-        raw_scores["range_position"] = range_pct
+        # Don't reward buying at the very top of the range
+        if range_pct > 0.9:
+            raw_scores["range_position"] = 0.3  # chasing the high
+        else:
+            raw_scores["range_position"] = range_pct
     else:
-        raw_scores["range_position"] = 1.0 - range_pct
+        if range_pct < 0.1:
+            raw_scores["range_position"] = 0.3  # chasing the low
+        else:
+            raw_scores["range_position"] = 1.0 - range_pct
     breakdown["range_position"] = f"Range position {range_pct:.0%} (low->high)"
 
-    # 6. Candle momentum
+    # 6. Candle momentum - require at least 2 bars, penalize single bar spikes
     last_n = close.iloc[-6:]
     changes = last_n.diff().dropna().values
     if signal_type == "CALL":
         streak = sum(1 for c in reversed(changes) if c > 0)
     else:
         streak = sum(1 for c in reversed(changes) if c < 0)
-    raw_scores["momentum"] = np.clip(streak / 4, 0, 1)
+    if streak >= 2:
+        raw_scores["momentum"] = np.clip(streak / 4, 0, 1)
+    elif streak == 1:
+        raw_scores["momentum"] = 0.2  # single bar moves are unreliable
+    else:
+        raw_scores["momentum"] = 0
     direction_word = "green" if signal_type == "CALL" else "red"
     breakdown["momentum"] = f"{streak} consecutive {direction_word} bars"
 
@@ -688,6 +1229,99 @@ def evaluate_signal(df, signal_type, event_ctx=None):
         raw_scores["event_timing"] = 1.0
         breakdown["event_timing"] = "No event data"
 
+    # 8. MACD confirmation (NEW) - does MACD agree with signal direction?
+    if "_macd" in df.columns and "_macd_signal" in df.columns:
+        macd_val = float(df["_macd"].iloc[-1])
+        macd_sig = float(df["_macd_signal"].iloc[-1])
+        macd_hist = float(df["_macd_hist"].iloc[-1])
+    else:
+        macd_l, macd_s, macd_h = compute_macd(close)
+        macd_val = float(macd_l.iloc[-1])
+        macd_sig = float(macd_s.iloc[-1])
+        macd_hist = float(macd_h.iloc[-1])
+
+    if signal_type == "CALL":
+        if macd_hist > 0 and macd_val > macd_sig:
+            raw_scores["macd_confirm"] = min(1.0, abs(macd_hist) / 0.3)
+        elif macd_hist > 0:
+            raw_scores["macd_confirm"] = 0.4
+        else:
+            raw_scores["macd_confirm"] = 0  # MACD bearish, calling bullish = bad
+    else:
+        if macd_hist < 0 and macd_val < macd_sig:
+            raw_scores["macd_confirm"] = min(1.0, abs(macd_hist) / 0.3)
+        elif macd_hist < 0:
+            raw_scores["macd_confirm"] = 0.4
+        else:
+            raw_scores["macd_confirm"] = 0  # MACD bullish, calling bearish = bad
+    breakdown["macd_confirm"] = f"MACD hist {macd_hist:+.3f}"
+
+    # 9. Trend alignment (NEW) - is price above/below key EMAs consistently?
+    price_above_ema9 = current_price > float(ema9.iloc[-1])
+    price_above_ema21 = current_price > float(ema21.iloc[-1])
+    price_above_vwap = current_price > current_vwap
+    if signal_type == "CALL":
+        alignment = sum([price_above_ema9, price_above_ema21, price_above_vwap])
+        raw_scores["trend_alignment"] = alignment / 3.0
+    else:
+        alignment = sum([not price_above_ema9, not price_above_ema21, not price_above_vwap])
+        raw_scores["trend_alignment"] = alignment / 3.0
+    breakdown["trend_alignment"] = f"{alignment}/3 indicators aligned"
+
+    # 10. RSI Divergence (NEW)
+    rsi_series_full = df["_rsi"] if "_rsi" in df.columns else compute_rsi(close)
+    div_type, div_strength = detect_rsi_divergence(close, rsi_series_full, lookback=20)
+    if div_type == "bullish" and signal_type == "CALL":
+        raw_scores["rsi_divergence"] = min(1.0, div_strength * 2)
+        breakdown["rsi_divergence"] = f"Bullish RSI divergence ({div_strength:.0%})"
+    elif div_type == "bearish" and signal_type == "PUT":
+        raw_scores["rsi_divergence"] = min(1.0, div_strength * 2)
+        breakdown["rsi_divergence"] = f"Bearish RSI divergence ({div_strength:.0%})"
+    elif div_type and ((div_type == "bullish" and signal_type == "PUT") or
+                       (div_type == "bearish" and signal_type == "CALL")):
+        raw_scores["rsi_divergence"] = 0
+        breakdown["rsi_divergence"] = f"{div_type.title()} divergence OPPOSES {signal_type.lower()}"
+    else:
+        raw_scores["rsi_divergence"] = 0.5
+        breakdown["rsi_divergence"] = "No divergence detected"
+
+    # 11. Bollinger Band Squeeze (NEW)
+    if "_bb_bandwidth" in df.columns:
+        bw = df["_bb_bandwidth"]
+        pct_b_val = float(df["_bb_pct_b"].iloc[-1]) if not pd.isna(df["_bb_pct_b"].iloc[-1]) else 0.5
+    else:
+        _, _, _, bw, pct_b = compute_bollinger_bands(close)
+        pct_b_val = float(pct_b.iloc[-1]) if not pd.isna(pct_b.iloc[-1]) else 0.5
+
+    is_squeeze, squeeze_intensity = detect_bb_squeeze(bw)
+    if is_squeeze:
+        if (signal_type == "CALL" and pct_b_val > 0.5) or (signal_type == "PUT" and pct_b_val < 0.5):
+            raw_scores["bb_squeeze"] = 0.5 + squeeze_intensity * 0.5
+            breakdown["bb_squeeze"] = f"BB squeeze ({squeeze_intensity:.0%}) + price aligned"
+        else:
+            raw_scores["bb_squeeze"] = 0.3
+            breakdown["bb_squeeze"] = f"BB squeeze ({squeeze_intensity:.0%}) direction unclear"
+    else:
+        if signal_type == "CALL":
+            raw_scores["bb_squeeze"] = np.clip(pct_b_val, 0, 1) * 0.6
+        else:
+            raw_scores["bb_squeeze"] = np.clip(1 - pct_b_val, 0, 1) * 0.6
+        breakdown["bb_squeeze"] = f"BB %B: {pct_b_val:.2f} (no squeeze)"
+
+    # 12. Candle Pattern Recognition (NEW)
+    patterns = detect_candle_patterns(df)
+    pattern_score = 0
+    pattern_names = []
+    for pname, pbias, pstrength in patterns:
+        if (pbias == "bullish" and signal_type == "CALL") or \
+           (pbias == "bearish" and signal_type == "PUT"):
+            pattern_score += pstrength
+            pattern_names.append(f"{pname} ({pbias})")
+        elif pbias != "neutral":
+            pattern_score -= pstrength * 0.5
+    raw_scores["candle_pattern"] = np.clip(pattern_score, 0, 1)
+    breakdown["candle_pattern"] = " + ".join(pattern_names) if pattern_names else "No significant patterns"
+
     total = sum(raw_scores[k] * weights[k] for k in weights)
     total = round(min(total, 100), 1)
     grade = score_to_grade(total)
@@ -695,7 +1329,7 @@ def evaluate_signal(df, signal_type, event_ctx=None):
     return {
         "score": total, "grade": grade, "breakdown": breakdown,
         "raw": raw_scores, "weights": weights, "rsi": rsi,
-        "ema9": ema9.iloc[-1], "ema21": ema21.iloc[-1], "vol_ratio": vol_ratio,
+        "ema9": float(ema9.iloc[-1]), "ema21": float(ema21.iloc[-1]), "vol_ratio": vol_ratio,
     }
 
 
@@ -703,20 +1337,20 @@ def evaluate_signal(df, signal_type, event_ctx=None):
 # Support / Resistance detection
 # ---------------------------------------------------------------------------
 
-def find_support_resistance(df, n_touches=2, tolerance_pct=0.05):
+def find_support_resistance(df, n_touches=2, tolerance_pct=0.08):
     """
     Find support and resistance levels from price action.
     Uses pivot highs/lows and clusters them within tolerance.
-    Returns list of (price, type, touches) tuples.
+    Returns list of (price, type, touches) tuples, limited to strongest.
     """
     highs = df["High"].values
     lows = df["Low"].values
     closes = df["Close"].values
 
-    if len(highs) < 5:
+    if len(highs) < 10:
         return []
 
-    # Find local pivot highs and lows (3-bar pivots)
+    # Find local pivot highs and lows (5-bar pivots for stronger levels)
     pivot_highs = []
     pivot_lows = []
     for i in range(2, len(highs) - 2):
@@ -767,16 +1401,18 @@ def find_support_resistance(df, n_touches=2, tolerance_pct=0.05):
     day_low = min(lows)
     # Check they aren't too close to existing levels
     for lvl_price, _, _ in levels:
-        if abs(day_high - lvl_price) < tol:
+        if day_high is not None and abs(day_high - lvl_price) < tol:
             day_high = None
-        if abs(day_low - lvl_price) < tol:
+        if day_low is not None and abs(day_low - lvl_price) < tol:
             day_low = None
     if day_high is not None:
         levels.append((day_high, "resistance", 1))
     if day_low is not None:
         levels.append((day_low, "support", 1))
 
-    levels.sort(key=lambda x: x[0])
+    levels.sort(key=lambda x: x[2], reverse=True)  # sort by touches
+    levels = levels[:6]  # keep only the strongest
+    levels.sort(key=lambda x: x[0])  # re-sort by price
     return levels
 
 
@@ -806,11 +1442,36 @@ class CandlestickWidget(FigureCanvas):
 
         # S/R state
         self.show_auto_sr = True
-        self.manual_lines = []  # list of price floats
+        self.show_bb_bands = True
+        self.show_vwap_bands = False
+        self.manual_lines = []
         self._last_ylim = None
+        self._chart_data = None
+        self._chart_labels = None
 
         # Double-click to add manual line
         self.mpl_connect("button_press_event", self._on_click)
+        # Crosshair tooltip on hover
+        self.mpl_connect("motion_notify_event", self._on_mouse_move)
+        self.mpl_connect("axes_leave_event", self._on_mouse_leave)
+
+    def _on_mouse_move(self, event):
+        """Show OHLCV tooltip on hover over price chart."""
+        if event.inaxes != self.ax_price or event.xdata is None:
+            QToolTip.hideText()
+            return
+        if self._chart_data is not None and self._chart_labels is not None:
+            idx = int(round(event.xdata))
+            if 0 <= idx < len(self._chart_data):
+                row = self._chart_data.iloc[idx]
+                lbl = self._chart_labels[idx] if idx < len(self._chart_labels) else ""
+                tip = (f"{lbl}\nO: ${row['Open']:.2f}  H: ${row['High']:.2f}\n"
+                       f"L: ${row['Low']:.2f}  C: ${row['Close']:.2f}\n"
+                       f"Vol: {row['Volume']:,.0f}")
+                QToolTip.showText(QCursor.pos(), tip, self)
+
+    def _on_mouse_leave(self, event):
+        QToolTip.hideText()
 
     def _on_click(self, event):
         """Double-click on price panel to add a manual horizontal line."""
@@ -866,6 +1527,9 @@ class CandlestickWidget(FigureCanvas):
             self.draw()
             return
 
+        # Store for crosshair tooltip
+        self._chart_data = data
+
         x = np.arange(len(data))
         opens = data["Open"].values
         closes = data["Close"].values
@@ -890,14 +1554,31 @@ class CandlestickWidget(FigureCanvas):
             self.ax_price.plot(x, data["VWAP"].values, color="#ffab00", linewidth=1.2,
                                label="VWAP", alpha=0.9)
 
-        ema9_vals = compute_ema(full_close, 9).iloc[-n_bars:].values
-        ema21_vals = compute_ema(full_close, 21).iloc[-n_bars:].values
+        ema9_vals = (full_df["_ema9"] if "_ema9" in full_df.columns else compute_ema(full_close, 9)).iloc[-n_bars:].values
+        ema21_vals = (full_df["_ema21"] if "_ema21" in full_df.columns else compute_ema(full_close, 21)).iloc[-n_bars:].values
         self.ax_price.plot(x, ema9_vals, color="#42a5f5", linewidth=0.8, label="EMA 9", alpha=0.7)
         self.ax_price.plot(x, ema21_vals, color="#ab47bc", linewidth=0.8, label="EMA 21", alpha=0.7)
 
-        # --- Auto S/R levels ---
+        # Bollinger Bands
+        if self.show_bb_bands and "_bb_upper" in full_df.columns:
+            bb_u = full_df["_bb_upper"].iloc[-n_bars:].values
+            bb_l = full_df["_bb_lower"].iloc[-n_bars:].values
+            self.ax_price.plot(x, bb_u, color="#ffffff", linewidth=0.5, linestyle=":", alpha=0.3, label="BB")
+            self.ax_price.plot(x, bb_l, color="#ffffff", linewidth=0.5, linestyle=":", alpha=0.3)
+            self.ax_price.fill_between(x, bb_l, bb_u, alpha=0.04, color="#ffffff")
+
+        # VWAP deviation bands
+        if self.show_vwap_bands and "_vwap_u1" in full_df.columns:
+            u1 = full_df["_vwap_u1"].iloc[-n_bars:].values
+            l1 = full_df["_vwap_l1"].iloc[-n_bars:].values
+            self.ax_price.fill_between(x, l1, u1, alpha=0.06, color="#ffab00")
+
+        # --- Auto S/R levels (cached until data changes) ---
         if self.show_auto_sr:
-            levels = find_support_resistance(full_df)
+            data_key = len(full_df)
+            if not hasattr(self, '_sr_cache') or self._sr_cache[0] != data_key:
+                self._sr_cache = (data_key, find_support_resistance(full_df))
+            levels = self._sr_cache[1]
             for price_level, level_type, touches in levels:
                 if level_type == "resistance":
                     color = "#ef5350"
@@ -934,7 +1615,7 @@ class CandlestickWidget(FigureCanvas):
         # Store ylim for click proximity detection
         self._last_ylim = self.ax_price.get_ylim()
 
-        rsi_full = compute_rsi(full_close, 14)
+        rsi_full = full_df["_rsi"] if "_rsi" in full_df.columns else compute_rsi(full_close, 14)
         rsi_vals = rsi_full.iloc[-n_bars:].values
         self.ax_rsi.plot(x, rsi_vals, color="#42a5f5", linewidth=1.0)
         self.ax_rsi.axhline(70, color="#ef5350", linewidth=0.6, linestyle="--", alpha=0.6)
@@ -945,7 +1626,12 @@ class CandlestickWidget(FigureCanvas):
         self.ax_rsi.set_ylabel("RSI", fontsize=7, color="#aaa")
         self.ax_rsi.yaxis.set_major_locator(mticker.FixedLocator([30, 50, 70]))
 
-        macd_line, signal_line, histogram = compute_macd(full_close)
+        if "_macd" in full_df.columns:
+            macd_line = full_df["_macd"]
+            signal_line = full_df["_macd_signal"]
+            histogram = full_df["_macd_hist"]
+        else:
+            macd_line, signal_line, histogram = compute_macd(full_close)
         macd_vals = macd_line.iloc[-n_bars:].values
         sig_vals = signal_line.iloc[-n_bars:].values
         hist_vals = histogram.iloc[-n_bars:].values
@@ -959,9 +1645,20 @@ class CandlestickWidget(FigureCanvas):
                             edgecolor="#444", labelcolor="#ccc")
 
         if hasattr(data.index, "strftime"):
-            labels = data.index.strftime("%H:%M")
+            # Choose format based on data resolution
+            if len(data) >= 2:
+                td = (data.index[-1] - data.index[0]).total_seconds() / max(len(data) - 1, 1)
+                if td >= 86000:  # daily
+                    labels = data.index.strftime("%m/%d")
+                elif td >= 3000:  # hourly
+                    labels = data.index.strftime("%m/%d %H:%M")
+                else:  # intraday
+                    labels = data.index.strftime("%H:%M")
+            else:
+                labels = data.index.strftime("%H:%M")
         else:
             labels = [str(i) for i in range(len(data))]
+        self._chart_labels = list(labels)  # store for tooltip
         step = max(1, len(x) // 10)
         self.ax_macd.set_xticks(x[::step])
         self.ax_macd.set_xticklabels(labels[::step], rotation=45, fontsize=6, color="#aaa")
@@ -983,12 +1680,31 @@ class SPYderScalpApp(QMainWindow):
         self.setWindowTitle("SPYderScalp")
         self.setGeometry(0, 0, 1366, 720)
         self.last_signal_time = None
+        self.last_signal_type = None    # Track direction for whipsaw detection
         self.signal_cooldown = 300
+        self.consecutive_same_signal = 0  # Track repeated signals for confirmation
         self.is_monitoring = False
         self.platform = platform.system()
+        self.prediction_history = []  # list of dicts tracking each signal
+        self.swing_prediction = None  # open/close swing forecast
+        self.session_pnl = []  # session P&L entries
+        self._settings = load_settings()
         self._build_ui()
+        self._apply_saved_settings()
         self.monitor_timer = QTimer()
         self.monitor_timer.timeout.connect(self.check_signals)
+        # Timer to check prediction outcomes every 30 seconds
+        self.prediction_check_timer = QTimer()
+        self.prediction_check_timer.timeout.connect(self._check_prediction_outcomes)
+        self.prediction_check_timer.start(30000)
+        # Memory cleanup every 10 minutes
+        self.cleanup_timer = QTimer()
+        self.cleanup_timer.timeout.connect(self._cleanup_memory)
+        self.cleanup_timer.start(600000)
+        # Live clock - ticks every second
+        self.clock_timer = QTimer()
+        self.clock_timer.timeout.connect(self._tick_clock)
+        self.clock_timer.start(1000)
 
     def _build_ui(self):
         root = QWidget()
@@ -1126,64 +1842,148 @@ class SPYderScalpApp(QMainWindow):
         hint.setStyleSheet("color:#666;")
         sr_row.addWidget(hint)
 
+        # BB and VWAP band toggles
+        self.cb_bb_bands = QCheckBox("BB")
+        self.cb_bb_bands.setChecked(True)
+        self.cb_bb_bands.setFont(QFont("Arial", 8))
+        self.cb_bb_bands.stateChanged.connect(lambda s: setattr(self.candle_chart, 'show_bb_bands', bool(s)))
+        sr_row.addWidget(self.cb_bb_bands)
+
+        self.cb_vwap_bands = QCheckBox("VWAP±σ")
+        self.cb_vwap_bands.setChecked(False)
+        self.cb_vwap_bands.setFont(QFont("Arial", 8))
+        self.cb_vwap_bands.stateChanged.connect(lambda s: setattr(self.candle_chart, 'show_vwap_bands', bool(s)))
+        sr_row.addWidget(self.cb_vwap_bands)
+
         sr_row.addStretch()
         left_layout.addLayout(sr_row)
+
+        # Chart timeframe selector row
+        tf_row = QHBoxLayout()
+        tf_row.setSpacing(2)
+        lbl_tf = QLabel("Chart:")
+        lbl_tf.setFont(QFont("Arial", 8))
+        lbl_tf.setStyleSheet("color:#aaa;")
+        tf_row.addWidget(lbl_tf)
+
+        self._chart_tf = "1m"  # current chart timeframe
+        self._chart_tf_buttons = {}
+        for tf_label in ["1m", "5m", "10m", "15m", "1h", "1d"]:
+            btn = QPushButton(tf_label)
+            btn.setFont(QFont("Arial", 7, QFont.Bold))
+            btn.setFixedHeight(20)
+            btn.setFixedWidth(34)
+            btn.setCursor(Qt.PointingHandCursor)
+            is_active = (tf_label == "1m")
+            if is_active:
+                btn.setStyleSheet("background:#2196F3;color:white;border-radius:2px;padding:1px 3px;")
+            else:
+                btn.setStyleSheet("background:#333;color:#aaa;border-radius:2px;padding:1px 3px;")
+            btn.clicked.connect(lambda checked, t=tf_label: self._set_chart_timeframe(t))
+            tf_row.addWidget(btn)
+            self._chart_tf_buttons[tf_label] = btn
+
+        tf_row.addStretch()
+        left_layout.addLayout(tf_row)
 
         self.candle_chart = CandlestickWidget(self)
         self.candle_chart.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         left_layout.addWidget(self.candle_chart, stretch=1)
         splitter.addWidget(left_widget)
 
-        # RIGHT: signals
+        # RIGHT: signals panel
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(2)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.setSpacing(3)
 
-        sig_header = QHBoxLayout()
+        # --- Status indicator ---
+        status_row = QHBoxLayout()
+        self.lbl_status_dot = QLabel("*")
+        self.lbl_status_dot.setFont(QFont("Arial", 14, QFont.Bold))
+        self.lbl_status_dot.setStyleSheet("color:#888;")
+        status_row.addWidget(self.lbl_status_dot)
+        self.lbl_status_text = QLabel("Idle")
+        self.lbl_status_text.setFont(QFont("Arial", 9))
+        self.lbl_status_text.setStyleSheet("color:#888;")
+        status_row.addWidget(self.lbl_status_text)
+        status_row.addStretch()
+        # Win/loss summary
+        self.lbl_track_summary = QLabel("")
+        self.lbl_track_summary.setFont(QFont("Arial", 8))
+        self.lbl_track_summary.setStyleSheet("color:#aaa;")
+        status_row.addWidget(self.lbl_track_summary)
+        right_layout.addLayout(status_row)
+
+        # --- Big signal visual: arrow + grade ---
+        sig_visual = QHBoxLayout()
+        sig_visual.setSpacing(8)
+        self.lbl_arrow = QLabel("")
+        self.lbl_arrow.setFont(QFont("Arial", 48, QFont.Bold))
+        self.lbl_arrow.setAlignment(Qt.AlignCenter)
+        self.lbl_arrow.setFixedWidth(60)
+        self.lbl_arrow.setFixedHeight(60)
+        sig_visual.addWidget(self.lbl_arrow)
+
+        sig_info = QVBoxLayout()
+        sig_info.setSpacing(0)
         self.lbl_signal = QLabel("No signal")
-        self.lbl_signal.setFont(QFont("Arial", 13, QFont.Bold))
-        sig_header.addWidget(self.lbl_signal)
-        self.lbl_grade = QLabel("")
-        self.lbl_grade.setFont(QFont("Arial", 22, QFont.Bold))
-        self.lbl_grade.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        sig_header.addWidget(self.lbl_grade)
-        right_layout.addLayout(sig_header)
+        self.lbl_signal.setFont(QFont("Arial", 14, QFont.Bold))
+        sig_info.addWidget(self.lbl_signal)
 
+        grade_hold = QHBoxLayout()
+        grade_hold.setSpacing(8)
+        self.lbl_grade = QLabel("")
+        self.lbl_grade.setFont(QFont("Arial", 20, QFont.Bold))
+        grade_hold.addWidget(self.lbl_grade)
         self.quality_bar = QProgressBar()
         self.quality_bar.setRange(0, 100)
         self.quality_bar.setValue(0)
         self.quality_bar.setTextVisible(True)
         self.quality_bar.setFormat("%v / 100")
-        self.quality_bar.setFixedHeight(18)
-        right_layout.addWidget(self.quality_bar)
+        self.quality_bar.setFixedHeight(16)
+        grade_hold.addWidget(self.quality_bar, stretch=1)
+        sig_info.addLayout(grade_hold)
+        sig_visual.addLayout(sig_info, stretch=1)
+        right_layout.addLayout(sig_visual)
 
-        hold_row = QHBoxLayout()
+        # --- Hold / DTE / Exit row ---
+        info_row = QHBoxLayout()
+        info_row.setSpacing(6)
         self.lbl_hold_time = QLabel("Hold: --")
-        self.lbl_hold_time.setFont(QFont("Arial", 10, QFont.Bold))
-        hold_row.addWidget(self.lbl_hold_time)
+        self.lbl_hold_time.setFont(QFont("Arial", 9, QFont.Bold))
+        info_row.addWidget(self.lbl_hold_time)
         self.lbl_exit_by = QLabel("")
         self.lbl_exit_by.setFont(QFont("Arial", 9))
-        self.lbl_exit_by.setAlignment(Qt.AlignRight)
-        hold_row.addWidget(self.lbl_exit_by)
+        info_row.addWidget(self.lbl_exit_by)
         self.lbl_hold_confidence = QLabel("")
         self.lbl_hold_confidence.setFont(QFont("Arial", 9))
-        self.lbl_hold_confidence.setAlignment(Qt.AlignRight)
-        hold_row.addWidget(self.lbl_hold_confidence)
-        right_layout.addLayout(hold_row)
-
-        # DTE recommendation row
-        dte_row = QHBoxLayout()
+        info_row.addWidget(self.lbl_hold_confidence)
+        info_row.addStretch()
         self.lbl_dte_rec = QLabel("DTE: --")
-        self.lbl_dte_rec.setFont(QFont("Arial", 10, QFont.Bold))
-        dte_row.addWidget(self.lbl_dte_rec)
+        self.lbl_dte_rec.setFont(QFont("Arial", 9, QFont.Bold))
+        info_row.addWidget(self.lbl_dte_rec)
         self.lbl_dte_detail = QLabel("")
-        self.lbl_dte_detail.setFont(QFont("Arial", 8))
+        self.lbl_dte_detail.setFont(QFont("Arial", 7))
         self.lbl_dte_detail.setStyleSheet("color:#aaa;")
-        dte_row.addWidget(self.lbl_dte_detail, stretch=1)
-        right_layout.addLayout(dte_row)
+        info_row.addWidget(self.lbl_dte_detail)
+        right_layout.addLayout(info_row)
 
-        # Tabs
+        # --- Swing prediction bar ---
+        swing_box = QGroupBox("Open/Close Swing Forecast")
+        swing_box.setFont(QFont("Arial", 8, QFont.Bold))
+        swing_box.setStyleSheet("QGroupBox{color:#aaa;border:1px solid #333;border-radius:3px;margin-top:6px;padding-top:10px;}")
+        swing_lay = QVBoxLayout(swing_box)
+        swing_lay.setContentsMargins(4, 2, 4, 2)
+        swing_lay.setSpacing(1)
+        self.lbl_swing = QLabel("Loading historical data...")
+        self.lbl_swing.setFont(QFont("Consolas", 8))
+        self.lbl_swing.setStyleSheet("color:#ccc;")
+        self.lbl_swing.setWordWrap(True)
+        swing_lay.addWidget(self.lbl_swing)
+        right_layout.addWidget(swing_box)
+
+        # --- Tabs ---
         self.tabs = QTabWidget()
         self.tabs.setFont(QFont("Arial", 8))
         tab_style = "background:#1a1a2e; color:#ccc; border:1px solid #333;"
@@ -1206,6 +2006,31 @@ class SPYderScalpApp(QMainWindow):
         tab_hold.layout().addWidget(self.lbl_hold_reasons)
         self.tabs.addTab(tab_hold, "Hold")
 
+        # History tab - prediction tracking
+        tab_hist = QWidget()
+        hist_layout = QVBoxLayout(tab_hist)
+        hist_layout.setContentsMargins(4, 4, 4, 4)
+        hist_top = QHBoxLayout()
+        hist_top.addStretch()
+        btn_export_csv = QPushButton("Export CSV")
+        btn_export_csv.setFont(QFont("Arial", 7))
+        btn_export_csv.setStyleSheet("background:#2196F3;color:white;padding:2px 8px;border-radius:2px;")
+        btn_export_csv.clicked.connect(self._export_history_csv)
+        hist_top.addWidget(btn_export_csv)
+        btn_clear_hist = QPushButton("Clear History")
+        btn_clear_hist.setFont(QFont("Arial", 7))
+        btn_clear_hist.setStyleSheet("background:#555;color:white;padding:2px 8px;border-radius:2px;")
+        btn_clear_hist.clicked.connect(self._clear_history)
+        hist_top.addWidget(btn_clear_hist)
+        hist_layout.addLayout(hist_top)
+        self.history_text = QTextEdit()
+        self.history_text.setReadOnly(True)
+        self.history_text.setFont(QFont("Consolas", 8))
+        self.history_text.setStyleSheet(tab_style)
+        self.history_text.setPlainText("No predictions yet. Signals will be tracked here.")
+        hist_layout.addWidget(self.history_text)
+        self.tabs.addTab(tab_hist, "History")
+
         tab_cal = QWidget()
         QVBoxLayout(tab_cal).setContentsMargins(4, 4, 4, 4)
         self.lbl_events = QTextEdit()
@@ -1217,22 +2042,107 @@ class SPYderScalpApp(QMainWindow):
         self.tabs.addTab(tab_cal, "Calendar")
 
         tab_log = QWidget()
-        QVBoxLayout(tab_log).setContentsMargins(4, 4, 4, 4)
+        log_layout = QVBoxLayout(tab_log)
+        log_layout.setContentsMargins(4, 4, 4, 4)
+        log_top = QHBoxLayout()
+        log_top.addStretch()
+        btn_clear_log = QPushButton("Clear Log")
+        btn_clear_log.setFont(QFont("Arial", 7))
+        btn_clear_log.setStyleSheet("background:#555;color:white;padding:2px 8px;border-radius:2px;")
+        btn_clear_log.clicked.connect(self._clear_log)
+        log_top.addWidget(btn_clear_log)
+        log_layout.addLayout(log_top)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setFont(QFont("Consolas", 8))
         self.log_text.setStyleSheet(tab_style)
-        tab_log.layout().addWidget(self.log_text)
+        log_layout.addWidget(self.log_text)
         self.tabs.addTab(tab_log, "Log")
 
         right_layout.addWidget(self.tabs, stretch=1)
         splitter.addWidget(right_widget)
         splitter.setSizes([820, 540])
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        left_widget.setMinimumWidth(400)
+        right_widget.setMinimumWidth(280)
         outer.addWidget(splitter, stretch=1)
 
     # -----------------------------------------------------------------------
     # S/R line controls
     # -----------------------------------------------------------------------
+    def _apply_saved_settings(self):
+        """Restore persisted settings to UI controls."""
+        s = self._settings
+        self.combo_min_grade.setCurrentText(s.get("min_grade", "C"))
+        self.spin_vol.setValue(s.get("vol_threshold", 150))
+        self.cb_calls.setChecked(s.get("show_calls", True))
+        self.cb_puts.setChecked(s.get("show_puts", True))
+        self.cb_auto_sr.setChecked(s.get("show_auto_sr", True))
+        self.cb_bb_bands.setChecked(s.get("show_bb", True))
+        self.cb_vwap_bands.setChecked(s.get("show_vwap_bands", False))
+        if s.get("chart_tf", "1m") != "1m":
+            self._set_chart_timeframe(s["chart_tf"])
+
+    def _save_current_settings(self):
+        """Persist current UI settings to disk."""
+        save_settings({
+            "min_grade": self.combo_min_grade.currentText(),
+            "vol_threshold": self.spin_vol.value(),
+            "show_calls": self.cb_calls.isChecked(),
+            "show_puts": self.cb_puts.isChecked(),
+            "chart_tf": getattr(self, '_chart_tf', '1m'),
+            "show_auto_sr": self.cb_auto_sr.isChecked(),
+            "show_bb": self.cb_bb_bands.isChecked(),
+            "show_vwap_bands": self.cb_vwap_bands.isChecked(),
+            "alert_sound": True,
+        })
+
+    def closeEvent(self, event):
+        """Save settings on exit."""
+        self._save_current_settings()
+        super().closeEvent(event)
+
+    def _tick_clock(self):
+        """Update live clock every second."""
+        et = now_et()
+        self.lbl_update.setText(et.strftime("%I:%M:%S %p ET"))
+        if market_is_open(et):
+            self.lbl_update.setStyleSheet(f"color:{THEME['green']};")
+        else:
+            self.lbl_update.setStyleSheet(f"color:{THEME['text_dim']};")
+
+    def _export_history_csv(self):
+        """Export prediction history to CSV file."""
+        if not self.prediction_history:
+            self._log("[!] No history to export")
+            return
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export History", f"spyderscalp_history_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            "CSV Files (*.csv)")
+        if not filepath:
+            return
+        try:
+            with open(filepath, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "time", "signal", "grade", "score", "entry_price",
+                    "exit_price", "pnl_pct", "result", "hold_minutes"])
+                writer.writeheader()
+                for pred in self.prediction_history:
+                    writer.writerow({
+                        "time": pred["time"],
+                        "signal": pred["signal"],
+                        "grade": pred["grade"],
+                        "score": pred["score"],
+                        "entry_price": pred["entry_price"],
+                        "exit_price": pred.get("exit_price", ""),
+                        "pnl_pct": pred.get("pnl_pct", ""),
+                        "result": pred.get("result", "PENDING"),
+                        "hold_minutes": pred.get("hold_minutes", ""),
+                    })
+            self._log(f"[OK] Exported {len(self.prediction_history)} records to {filepath}")
+        except Exception as e:
+            self._log(f"[!] Export failed: {e}")
     def _toggle_auto_sr(self, state):
         self.candle_chart.show_auto_sr = bool(state)
 
@@ -1245,14 +2155,105 @@ class SPYderScalpApp(QMainWindow):
     def _clear_manual_lines(self):
         self.candle_chart.clear_manual_lines()
 
+    def _set_chart_timeframe(self, tf):
+        """Switch chart timeframe and refresh."""
+        self._chart_tf = tf
+        # Update button styles
+        for label, btn in self._chart_tf_buttons.items():
+            if label == tf:
+                btn.setStyleSheet("background:#2196F3;color:white;border-radius:2px;padding:1px 3px;")
+            else:
+                btn.setStyleSheet("background:#333;color:#aaa;border-radius:2px;padding:1px 3px;")
+        # Fetch and display chart data for selected timeframe
+        self._refresh_chart_for_timeframe()
+
+    def _refresh_chart_for_timeframe(self):
+        """Fetch data for the selected chart timeframe and update chart."""
+        tf = self._chart_tf
+        # Map timeframe label to yfinance params
+        tf_map = {
+            "1m":  {"period": "1d",  "interval": "1m",  "bars": 60},
+            "5m":  {"period": "5d",  "interval": "5m",  "bars": 60},
+            "10m": {"period": "5d",  "interval": "15m", "bars": 48},  # yf has no 10m; use 15m as closest
+            "15m": {"period": "5d",  "interval": "15m", "bars": 48},
+            "1h":  {"period": "1mo", "interval": "1h",  "bars": 60},
+            "1d":  {"period": "6mo", "interval": "1d",  "bars": 120},
+        }
+        params = tf_map.get(tf, tf_map["1m"])
+        try:
+            df = yf_download_safe("SPY", period=params["period"], interval=params["interval"])
+            if df is None:
+                self._log(f"[!] No data for {tf} timeframe")
+                return
+            if len(df) < 2:
+                return
+
+            df = self._calc_vwap(df)
+            # Compute indicators for chart display
+            close = df["Close"]
+            df["_rsi"] = compute_rsi(close, 14)
+            df["_ema9"] = compute_ema(close, 9)
+            df["_ema21"] = compute_ema(close, 21)
+            macd_l, macd_s, macd_h = compute_macd(close)
+            df["_macd"] = macd_l
+            df["_macd_signal"] = macd_s
+            df["_macd_hist"] = macd_h
+
+            # Store for reference by chart
+            self._chart_df = df
+            self.candle_chart.update_chart(df, n_bars=params["bars"])
+            self.candle_chart.repaint()
+
+            # Update x-axis date format based on timeframe
+            actual_tf = tf if tf != "10m" else "15m"
+            self._log(f"[>] Chart: {len(df)} bars ({actual_tf})")
+        except Exception as e:
+            self._log(f"[!] Chart fetch failed for {tf}: {e}")
+
     # -----------------------------------------------------------------------
     # Controls
     # -----------------------------------------------------------------------
+    def _update_status(self, state):
+        """Update the monitoring status indicator."""
+        states = {
+            "monitoring": ("*", "#26a69a", "Monitoring (every 60s)"),
+            "scanning": ("*", "#ffab00", "Scanning..."),
+            "idle": ("*", "#888", "Idle - press Start"),
+            "stopped": ("*", "#ef5350", "Stopped"),
+        }
+        dot, color, text = states.get(state, states["idle"])
+        self.lbl_status_dot.setText(dot)
+        self.lbl_status_dot.setStyleSheet(f"color:{color};")
+        self.lbl_status_text.setText(text)
+        self.lbl_status_text.setStyleSheet(f"color:{color};")
+
     def start_monitoring(self):
+        et = now_et()
+        if not market_is_open(et):
+            self._log(f"[!] Market is closed ({et.strftime('%I:%M %p ET %a')}). Will scan once to show latest data.")
+            self._update_status("stopped")
+            self.lbl_signal.setText("Market Closed")
+            self.lbl_signal.setStyleSheet("color:#888;")
+            # Still do one scan to populate the chart, but don't start the timer
+            try:
+                df, data_mode = self._fetch_data()
+                if df is not None and not df.empty:
+                    df = self._calc_vwap(df)
+                    self.candle_chart.update_chart(df, n_bars=60)
+                    self.candle_chart.repaint()
+                    current_price = float(df["Close"].iloc[-1])
+                    self.lbl_price.setText(f"SPY ${current_price:.2f}")
+                    self.lbl_update.setText(et.strftime("%I:%M:%S %p ET"))
+                    self._log(f"[>] Loaded last session data for preview")
+            except Exception:
+                pass
+            return
+
         self.is_monitoring = True
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.monitor_timer.start(60000)
+        self._update_status("monitoring")
         self._log("[OK] Monitoring started - scanning every 60 seconds")
         self.check_signals()
 
@@ -1261,11 +2262,17 @@ class SPYderScalpApp(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.monitor_timer.stop()
+        self._update_status("stopped")
         self._log("[STOP] Monitoring stopped")
 
     def manual_scan(self):
         self._log("[SCAN] Manual scan initiated...")
+        self._update_status("scanning")
         self.check_signals()
+        if self.is_monitoring:
+            self._update_status("monitoring")
+        else:
+            self._update_status("idle")
 
     # -----------------------------------------------------------------------
     # Core logic
@@ -1273,6 +2280,20 @@ class SPYderScalpApp(QMainWindow):
     def _calc_vwap(self, df):
         tp = (df["High"] + df["Low"] + df["Close"]) / 3
         df["VWAP"] = (tp * df["Volume"]).cumsum() / df["Volume"].cumsum()
+        # Bollinger Bands
+        close = df["Close"]
+        bb_u, bb_m, bb_l, bb_bw, bb_pb = compute_bollinger_bands(close)
+        df["_bb_upper"] = bb_u
+        df["_bb_middle"] = bb_m
+        df["_bb_lower"] = bb_l
+        df["_bb_bandwidth"] = bb_bw
+        df["_bb_pct_b"] = bb_pb
+        # VWAP deviation bands
+        _, vu1, vl1, vu2, vl2 = compute_vwap_bands(df)
+        df["_vwap_u1"] = vu1
+        df["_vwap_l1"] = vl1
+        df["_vwap_u2"] = vu2
+        df["_vwap_l2"] = vl2
         return df
 
     def _min_grade_score(self):
@@ -1287,21 +2308,48 @@ class SPYderScalpApp(QMainWindow):
         ]
         for strat in strategies:
             try:
-                df = yf.download("SPY", period=strat["period"], interval=strat["interval"],
-                                 progress=False, auto_adjust=True, multi_level_index=False)
-                if df is not None and not df.empty and len(df) >= 2:
-                    if isinstance(df.columns, pd.MultiIndex):
-                        df.columns = df.columns.get_level_values(0)
-                    min_bars = 15 if strat["label"] != "daily" else 2
-                    if len(df) >= min_bars:
-                        self._log(f"[>] Data: {len(df)} bars ({strat['label']}, {strat['interval']})")
-                        return df, strat["label"]
+                df = yf_download_safe("SPY", period=strat["period"], interval=strat["interval"])
+                if df is None or len(df) < (15 if strat["label"] != "daily" else 2):
+                    continue
+                self._log(f"[>] Data: {len(df)} bars ({strat['label']}, {strat['interval']})")
+                return df, strat["label"]
             except Exception as ex:
                 self._log(f"[!] Fetch {strat['label']} failed: {type(ex).__name__}: {ex}")
                 continue
         return None, None
 
+    def _fetch_mtf_data(self):
+        """Fetch 5m and 15m data for multi-timeframe confirmation. Cached 2 min."""
+        now = datetime.now()
+        if hasattr(self, '_mtf_cache') and self._mtf_cache:
+            cache_time, cached_5m, cached_15m = self._mtf_cache
+            if (now - cache_time).seconds < 120:
+                return cached_5m, cached_15m
+
+        df_5m = yf_download_safe("SPY", period="5d", interval="5m")
+        if df_5m is not None and len(df_5m) < 10:
+            df_5m = None
+        df_15m = yf_download_safe("SPY", period="5d", interval="15m")
+        if df_15m is not None and len(df_15m) < 10:
+            df_15m = None
+
+        self._mtf_cache = (now, df_5m, df_15m)
+        return df_5m, df_15m
+
     def check_signals(self):
+        # Only scan during market hours (9:30 AM - 4:00 PM ET, weekdays)
+        et = now_et()
+        if not market_is_open(et):
+            if self.is_monitoring:
+                self.stop_monitoring()
+                self._log(f"[STOP] Market closed ({et.strftime('%I:%M %p ET')}) - monitoring paused until next open")
+                self._update_status("stopped")
+                self.lbl_signal.setText("Market Closed")
+                self.lbl_signal.setStyleSheet("color:#888;")
+                self.lbl_arrow.setText("")
+                self.lbl_arrow.setStyleSheet("")
+            return
+
         try:
             df, data_mode = self._fetch_data()
             if df is None or df.empty:
@@ -1314,16 +2362,42 @@ class SPYderScalpApp(QMainWindow):
                 return
 
             df = self._calc_vwap(df)
-            self.candle_chart.update_chart(df, n_bars=60)
 
-            current_price = df["Close"].iloc[-1]
-            current_vwap = df["VWAP"].iloc[-1]
-            avg_vol = df["Volume"].iloc[-21:-1].mean() if len(df) > 21 else df["Volume"].mean()
-            vol_ratio = df["Volume"].iloc[-1] / avg_vol if avg_vol > 0 else 0
-            rsi_s = compute_rsi(df["Close"])
-            rsi_val = rsi_s.iloc[-1] if not pd.isna(rsi_s.iloc[-1]) else 0
-            ema9 = compute_ema(df["Close"], 9).iloc[-1]
-            ema21 = compute_ema(df["Close"], 21).iloc[-1]
+            # Pre-compute indicators ONCE and cache on DataFrame
+            close = df["Close"]
+            if "_rsi" not in df.columns:
+                df["_rsi"] = compute_rsi(close, 14)
+                df["_ema9"] = compute_ema(close, 9)
+                df["_ema21"] = compute_ema(close, 21)
+                macd_l, macd_s, macd_h = compute_macd(close)
+                df["_macd"] = macd_l
+                df["_macd_signal"] = macd_s
+                df["_macd_hist"] = macd_h
+
+            self.candle_chart.update_chart(df, n_bars=60)
+            # Only refresh for non-1m timeframe if selected (don't redraw twice)
+            if hasattr(self, '_chart_tf') and self._chart_tf != "1m":
+                self._refresh_chart_for_timeframe()
+            else:
+                self.candle_chart.repaint()
+
+            current_price = float(df["Close"].iloc[-1])
+            current_vwap = float(df["VWAP"].iloc[-1])
+
+            # Volume: use the last COMPLETED bar (-2), not the still-forming bar (-1)
+            if len(df) > 22:
+                last_vol = float(df["Volume"].iloc[-2])
+                avg_vol = float(df["Volume"].iloc[-22:-2].mean())
+            elif len(df) > 3:
+                last_vol = float(df["Volume"].iloc[-2])
+                avg_vol = float(df["Volume"].iloc[:-2].mean())
+            else:
+                last_vol = float(df["Volume"].iloc[-1])
+                avg_vol = float(df["Volume"].mean())
+            vol_ratio = last_vol / avg_vol if avg_vol > 0 else 0.0
+            rsi_val = float(df["_rsi"].iloc[-1]) if not pd.isna(df["_rsi"].iloc[-1]) else 0.0
+            ema9 = float(df["_ema9"].iloc[-1])
+            ema21 = float(df["_ema21"].iloc[-1])
 
             self.lbl_price.setText(f"SPY ${current_price:.2f}")
             self.lbl_vwap.setText(f"VWAP ${current_vwap:.2f}")
@@ -1334,20 +2408,85 @@ class SPYderScalpApp(QMainWindow):
 
             vol_threshold = self.spin_vol.value() / 100.0
             signal_type = None
-            if self.cb_calls.isChecked() and current_price > current_vwap and vol_ratio > vol_threshold:
-                signal_type = "CALL"
-            if self.cb_puts.isChecked() and current_price < current_vwap and vol_ratio > vol_threshold:
-                signal_type = "PUT"
+
+            # Determine signal direction - require multiple confirmations
+            price_above_vwap = current_price > current_vwap
+            price_below_vwap = current_price < current_vwap
+            vol_ok = vol_ratio > vol_threshold
+
+            # Require price to be meaningfully away from VWAP (not just 1 cent)
+            vwap_distance_pct = abs(current_price - current_vwap) / current_vwap * 100
+            vwap_clear = vwap_distance_pct > 0.02  # at least 0.02% from VWAP
+
+            # EMA confirmation: at least EMA9 should agree with direction
+            ema9_confirms_call = ema9 > ema21
+            ema9_confirms_put = ema9 < ema21
+
+            # MACD histogram direction
+            macd_hist = float(df["_macd_hist"].iloc[-1]) if "_macd_hist" in df.columns else 0
+            macd_confirms_call = macd_hist > 0
+            macd_confirms_put = macd_hist < 0
+
+            if self.cb_calls.isChecked() and price_above_vwap and vol_ok and vwap_clear:
+                # Require at least 1 of: EMA confirmation or MACD confirmation
+                if ema9_confirms_call or macd_confirms_call:
+                    signal_type = "CALL"
+            if self.cb_puts.isChecked() and price_below_vwap and vol_ok and vwap_clear:
+                if ema9_confirms_put or macd_confirms_put:
+                    signal_type = "PUT"
+
+            # Log why no signal (helps debug)
+            if signal_type is None:
+                reasons = []
+                if not price_above_vwap and not price_below_vwap:
+                    reasons.append(f"price = VWAP (${current_price:.2f})")
+                elif price_above_vwap and not self.cb_calls.isChecked():
+                    reasons.append("price > VWAP but Calls unchecked")
+                elif price_below_vwap and not self.cb_puts.isChecked():
+                    reasons.append("price < VWAP but Puts unchecked")
+                if not vol_ok:
+                    reasons.append(f"vol {vol_ratio:.2f}x < threshold {vol_threshold:.2f}x")
+                if not vwap_clear:
+                    reasons.append(f"too close to VWAP ({vwap_distance_pct:.3f}%)")
+                if price_above_vwap and not ema9_confirms_call and not macd_confirms_call:
+                    reasons.append("no EMA/MACD confirmation for CALL")
+                if price_below_vwap and not ema9_confirms_put and not macd_confirms_put:
+                    reasons.append("no EMA/MACD confirmation for PUT")
+                direction = "above" if price_above_vwap else "below"
+                diff = abs(current_price - current_vwap)
+                self._log(f"    No signal: ${current_price:.2f} ({direction} VWAP by ${diff:.2f}) | vol {vol_ratio:.2f}x | {', '.join(reasons)}")
 
             if signal_type:
                 event_ctx = get_event_context(now_et())
                 result = evaluate_signal(df, signal_type, event_ctx)
+
+                # Multi-timeframe confirmation layer
+                df_5m, df_15m = self._fetch_mtf_data()
+                mtf_mult, mtf_reasons, mtf_detail = compute_mtf_confirmation(
+                    signal_type, df_5m, df_15m)
+
+                # Apply MTF multiplier to score
+                original_score = result["score"]
+                adjusted_score = round(min(original_score * mtf_mult, 100), 1)
+                result["score"] = adjusted_score
+                result["grade"] = score_to_grade(adjusted_score)
+                result["mtf_multiplier"] = mtf_mult
+                result["mtf_reasons"] = mtf_reasons
+                result["mtf_detail"] = mtf_detail
+                result["original_score"] = original_score
+
+                if mtf_mult != 1.0:
+                    self._log(f"    MTF: {original_score:.1f} x {mtf_mult:.2f} = {adjusted_score:.1f} ({result['grade']})")
+                    for r in mtf_reasons:
+                        self._log(f"      {r}")
+
                 self._update_gauge(signal_type, result)
                 self._update_events(event_ctx)
 
                 # DTE recommendation
                 dte_rec = recommend_dte(result["score"], result["grade"],
-                                        result["vol_ratio"], result["rsi"], event_ctx)
+                                        result["vol_ratio"], result["rsi"], event_ctx,
+                                        mtf_multiplier=mtf_mult)
                 self._update_dte_display(dte_rec)
                 rec_dte = dte_rec["recommended_dte"]
 
@@ -1358,16 +2497,29 @@ class SPYderScalpApp(QMainWindow):
                     self._update_hold_display(hold)
                     return
 
+                # Cooldown check
                 if self.last_signal_time and (datetime.now() - self.last_signal_time).seconds < self.signal_cooldown:
-                    self.lbl_signal.setText(f"{signal_type} {result['grade']} (cooldown)")
-                    return
+                    # Direction flip within cooldown = whipsaw, require A grade to override
+                    if self.last_signal_type and self.last_signal_type != signal_type:
+                        if result["grade"] not in ("A+", "A"):
+                            self.lbl_signal.setText(f"{signal_type} {result['grade']} (whipsaw - need A+ to flip)")
+                            self._log(f"    [!] Whipsaw detected: {self.last_signal_type}->{signal_type} within cooldown, need A+ to override")
+                            return
+                        else:
+                            self._log(f"    [!] Whipsaw override: strong {result['grade']} signal, allowing direction flip")
+                    else:
+                        self.lbl_signal.setText(f"{signal_type} {result['grade']} (cooldown)")
+                        return
 
                 self.last_signal_time = datetime.now()
+                self.last_signal_type = signal_type
                 self._trigger_alert(signal_type, current_price, current_vwap, vol_ratio, result, event_ctx, dte_rec)
             else:
                 self.lbl_signal.setText("No signal")
                 self.lbl_signal.setStyleSheet("color:#888;")
                 self.lbl_grade.setText("")
+                self.lbl_arrow.setText("")
+                self.lbl_arrow.setStyleSheet("")
                 self.quality_bar.setValue(0)
                 self.lbl_breakdown.setPlainText("")
                 self.lbl_hold_time.setText("Hold: --")
@@ -1397,6 +2549,14 @@ class SPYderScalpApp(QMainWindow):
         self.lbl_grade.setStyleSheet(f"color:{color};")
         self.quality_bar.setValue(int(s))
 
+        # Big arrow visual
+        if signal_type == "CALL":
+            self.lbl_arrow.setText("^")
+            self.lbl_arrow.setStyleSheet(f"color:{color}; background:#1a2e1a; border-radius:6px;")
+        else:
+            self.lbl_arrow.setText("v")
+            self.lbl_arrow.setStyleSheet(f"color:{color}; background:#2e1a1a; border-radius:6px;")
+
         bd_lines = []
         for key, desc in result["breakdown"].items():
             raw = result["raw"][key]
@@ -1404,6 +2564,24 @@ class SPYderScalpApp(QMainWindow):
             pts = raw * w
             bar = "#" * int(raw * 10) + "." * (10 - int(raw * 10))
             bd_lines.append(f"  {key:<16s} [{bar}] {pts:5.1f}/{w}  ({desc})")
+        # MTF confirmation line
+        mtf_mult = result.get("mtf_multiplier", 1.0)
+        orig_score = result.get("original_score")
+        if mtf_mult != 1.0 and orig_score is not None:
+            if mtf_mult > 1.0:
+                mtf_icon = "[OK]"
+            elif mtf_mult >= 0.85:
+                mtf_icon = "[!]"
+            else:
+                mtf_icon = "[!!]"
+            bd_lines.append(f"")
+            bd_lines.append(f"  {mtf_icon} MTF: {orig_score:.1f} x {mtf_mult:.2f} = {result['score']:.1f}")
+            mtf_results = result.get("mtf_detail", {})
+            if mtf_results:
+                res = mtf_results.get("results", {})
+                for tf, status in res.items():
+                    if status != "unavailable":
+                        bd_lines.append(f"       {tf}: {status}")
         self.lbl_breakdown.setPlainText("\n".join(bd_lines))
         self.tabs.setCurrentIndex(0)
 
@@ -1491,6 +2669,9 @@ class SPYderScalpApp(QMainWindow):
         self._play_sound()
         explanation = self._build_signal_explanation(signal_type, price, vwap, vol_ratio, result, event_ctx, hold)
 
+        # Record prediction for tracking
+        self._record_prediction(signal_type, price, result["score"], result["grade"], hold["hold_minutes"])
+
         log = (
             f"\n{'=' * 60}\n"
             f"[!] {signal_type} SIGNAL - Grade {result['grade']} ({result['score']}/100)\n"
@@ -1513,6 +2694,16 @@ class SPYderScalpApp(QMainWindow):
             log += f"\nDTE RECOMMENDATION: {dte_rec['recommended_dte']}DTE\n"
             log += f"  {dte_rec['recommendation']}\n"
             for r in dte_rec["reasoning"]:
+                log += f"    * {r}\n"
+        # MTF confirmation details
+        mtf_reasons = result.get("mtf_reasons", [])
+        mtf_mult = result.get("mtf_multiplier", 1.0)
+        orig_score = result.get("original_score")
+        if mtf_reasons:
+            log += f"\nMULTI-TIMEFRAME CONFIRMATION:\n"
+            if orig_score is not None and mtf_mult != 1.0:
+                log += f"  Base score: {orig_score:.1f} x {mtf_mult:.2f} = {result['score']:.1f}\n"
+            for r in mtf_reasons:
                 log += f"    * {r}\n"
         log += f"{'=' * 60}\n"
         self._log(log)
@@ -1569,7 +2760,7 @@ class SPYderScalpApp(QMainWindow):
                 lines.append(f"  [~] RSI: {rsi:.0f} - overbought. Move may be running out of steam.")
             elif 55 <= rsi <= 68:
                 lines.append(f"  [OK] RSI: {rsi:.0f} - healthy bullish momentum, not overbought.")
-            elif rsi < 45:
+            elif rsi < 40:
                 lines.append(f"  [X] RSI: {rsi:.0f} - momentum is actually bearish.")
             else:
                 lines.append(f"  [~] RSI: {rsi:.0f} - neutral, no strong confirmation.")
@@ -1592,6 +2783,37 @@ class SPYderScalpApp(QMainWindow):
             lines.append(f"  [X] Trend: EMAs not aligned with this {signal_type}.")
             lines.append(f"      Trading against the short-term trend.")
 
+        # MACD confirmation
+        macd_raw = raw.get("macd_confirm", 0)
+        if macd_raw > 0.7:
+            lines.append(f"  [OK] MACD: Histogram confirms {direction} momentum.")
+        elif macd_raw > 0.3:
+            lines.append(f"  [~] MACD: Weakly confirming - histogram fading.")
+        elif macd_raw > 0:
+            lines.append(f"  [X] MACD: Not confirming this {signal_type}.")
+            lines.append(f"      Momentum divergence - this move may not hold.")
+        else:
+            lines.append(f"  [X] MACD: Pointing opposite direction - significant headwind.")
+
+        # Trend alignment
+        align_raw = raw.get("trend_alignment", 0)
+        if align_raw >= 0.9:
+            lines.append(f"  [OK] All indicators aligned - clean setup.")
+        elif align_raw >= 0.5:
+            lines.append(f"  [~] Mixed alignment - some indicators disagree.")
+        else:
+            lines.append(f"  [X] Poor alignment - fighting the trend on multiple fronts.")
+
+        # Time of day warning
+        et_now = now_et()
+        time_decimal = et_now.hour + et_now.minute / 60.0
+        if time_decimal >= 15.0:
+            lines.append(f"  [!!] FINAL HOUR: Moves are less reliable, use tight stops.")
+        elif time_decimal >= 14.0:
+            lines.append(f"  [!] Late afternoon: Follow-through weaker, consider smaller size.")
+        elif 11.5 <= time_decimal < 13.0:
+            lines.append(f"  [~] Lunch hour: Choppier conditions, expect more noise.")
+
         evt_raw = raw.get("event_timing", 1.0)
         nearest = event_ctx.get("nearest_event") if event_ctx else None
         if evt_raw < 0.5 and nearest:
@@ -1605,26 +2827,62 @@ class SPYderScalpApp(QMainWindow):
         else:
             lines.append(f"  [OK] No imminent economic events - clear window to trade.")
 
+        # Multi-timeframe confirmation
+        mtf_mult = result.get("mtf_multiplier", 1.0)
+        mtf_detail = result.get("mtf_detail")
+        if mtf_detail and mtf_detail is not None:
+            results = mtf_detail.get("results", {})
+            lines.append("")
+            if mtf_mult >= 1.1:
+                lines.append(f"  [OK] MULTI-TIMEFRAME: 5m+15m both confirm this {signal_type} ({mtf_mult:.0%} boost)")
+                lines.append(f"       Higher timeframes aligned - high-conviction setup.")
+            elif mtf_mult >= 1.0:
+                conf_tfs = [k for k, v in results.items() if v == "confirming"]
+                if conf_tfs:
+                    lines.append(f"  [OK] MTF: {', '.join(conf_tfs)} confirms (mild boost)")
+                else:
+                    lines.append(f"  [~] MTF: Higher timeframes are neutral - proceed normally.")
+            elif mtf_mult >= 0.85:
+                conf_tfs = [k for k, v in results.items() if v == "conflicting"]
+                lines.append(f"  [!] MTF WARNING: {', '.join(conf_tfs)} conflicts with this {signal_type}")
+                lines.append(f"      Score reduced by {(1-mtf_mult)*100:.0f}%. Consider smaller size.")
+            else:
+                lines.append(f"  [!!] MTF CONFLICT: Both 5m and 15m oppose this {signal_type}!")
+                lines.append(f"       Score reduced by {(1-mtf_mult)*100:.0f}%. High risk of failure.")
+
         return "\n".join(lines)
 
-    def _get_nearest_dte(self):
+    def _get_cached_expirations(self):
+        """Cache options expirations for 5 minutes to avoid repeated API calls."""
+        now = datetime.now()
+        if hasattr(self, '_exp_cache') and self._exp_cache:
+            cache_time, exps = self._exp_cache
+            if (now - cache_time).seconds < 300:
+                return exps
         try:
             spy = yf.Ticker("SPY")
-            expirations = spy.options
-            today = datetime.now().date()
-            for exp in expirations[:5]:
+            exps = spy.options
+            self._exp_cache = (now, exps)
+            return exps
+        except Exception:
+            return []
+
+    def _get_nearest_dte(self):
+        exps = self._get_cached_expirations()
+        today = datetime.now().date()
+        for exp in exps[:5]:
+            try:
                 exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
                 dte = (exp_date - today).days
                 if 0 <= dte <= 2:
                     return dte
-        except Exception:
-            pass
+            except Exception:
+                pass
         return 1
 
     def _get_options_rec(self, signal_type, price):
         try:
-            spy = yf.Ticker("SPY")
-            expirations = spy.options
+            expirations = self._get_cached_expirations()
             if not expirations:
                 return "[!] No options data"
             today = datetime.now().date()
@@ -1657,11 +2915,350 @@ class SPYderScalpApp(QMainWindow):
         self.log_text.append(msg)
         sb = self.log_text.verticalScrollBar()
         sb.setValue(sb.maximum())
+        # Auto-trim log to last 500 lines
+        doc = self.log_text.document()
+        if doc.blockCount() > 500:
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(cursor.Start)
+            for _ in range(doc.blockCount() - 500):
+                cursor.movePosition(cursor.Down, cursor.KeepAnchor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()  # remove trailing newline
+
+    def _clear_log(self):
+        self.log_text.clear()
+        self._log("[OK] Log cleared")
+
+    def _clear_history(self):
+        self.prediction_history.clear()
+        self.history_text.setPlainText("History cleared.")
+        self._update_track_summary()
+        self._log("[OK] Prediction history cleared")
+
+    def _cleanup_memory(self):
+        """Free memory from old data. Called periodically or manually."""
+        import gc
+        # Trim prediction history to last 100
+        if len(self.prediction_history) > 100:
+            # Keep only resolved + last 100
+            self.prediction_history = self.prediction_history[-100:]
+            self._update_history_display()
+            self._log("[OK] Trimmed prediction history to 100 entries")
+        # Close scanner window if hidden
+        if hasattr(self, '_scanner_win') and self._scanner_win and not self._scanner_win.isVisible():
+            self._scanner_win.close()
+            self._scanner_win = None
+        gc.collect()
 
     def _open_scanner(self):
         self._scanner_win = OptionsValueScanner()
         self._scanner_win.show()
         self._scanner_win.run_scan()
+
+    # -------------------------------------------------------------------
+    # Prediction tracking
+    # -------------------------------------------------------------------
+    def _record_prediction(self, signal_type, price, score, grade, hold_minutes):
+        """Record a signal as a prediction to track."""
+        et = now_et()
+        pred = {
+            "time": et.strftime("%I:%M %p"),
+            "timestamp": et,
+            "signal": signal_type,
+            "entry_price": price,
+            "score": score,
+            "grade": grade,
+            "hold_minutes": hold_minutes,
+            "check_time": et + timedelta(minutes=hold_minutes),
+            "exit_price": None,
+            "result": None,  # "WIN", "LOSS", "FLAT", "PENDING"
+            "pnl_pct": None,
+        }
+        self.prediction_history.append(pred)
+        self._update_history_display()
+        return pred
+
+    def _check_prediction_outcomes(self):
+        """Called by timer - checks if any pending predictions have reached their exit time."""
+        if not market_is_open():
+            return  # Don't fetch when market is closed
+
+        et = now_et()
+        # Find all predictions that need checking
+        pending = [p for p in self.prediction_history
+                   if (p["result"] is None or p["result"] == "PENDING") and et >= p["check_time"]]
+        if not pending:
+            return
+
+        # Single fetch for all pending predictions
+        try:
+            df = yf_download_safe("SPY", period="1d", interval="1m")
+            if df is None:
+                return
+            exit_price = float(df["Close"].iloc[-1])
+        except Exception:
+            return
+
+        for pred in pending:
+            pred["exit_price"] = exit_price
+            entry = pred["entry_price"]
+            if pred["signal"] == "CALL":
+                pnl = (exit_price - entry) / entry * 100
+            else:
+                pnl = (entry - exit_price) / entry * 100
+            pred["pnl_pct"] = round(pnl, 3)
+
+            # Thresholds scale with hold time - longer holds need bigger moves to win
+            hold_min = pred.get("hold_minutes", 15)
+            if hold_min <= 10:
+                win_threshold = 0.02   # quick scalp
+                loss_threshold = -0.02
+            elif hold_min <= 20:
+                win_threshold = 0.03
+                loss_threshold = -0.03
+            else:
+                win_threshold = 0.05   # longer holds should produce more
+                loss_threshold = -0.04
+
+            if pnl > win_threshold:
+                pred["result"] = "WIN"
+            elif pnl < loss_threshold:
+                pred["result"] = "LOSS"
+            else:
+                pred["result"] = "FLAT"
+
+        # Mark remaining not-yet-due as PENDING
+        for pred in self.prediction_history:
+            if pred["result"] is None:
+                pred["result"] = "PENDING"
+
+        self._update_history_display()
+        self._update_track_summary()
+
+    def _update_track_summary(self):
+        """Update the win/loss summary in the status bar."""
+        resolved = [p for p in self.prediction_history if p["result"] in ("WIN", "LOSS", "FLAT")]
+        if not resolved:
+            self.lbl_track_summary.setText("")
+            return
+        wins = sum(1 for p in resolved if p["result"] == "WIN")
+        losses = sum(1 for p in resolved if p["result"] == "LOSS")
+        flats = sum(1 for p in resolved if p["result"] == "FLAT")
+        total = len(resolved)
+        rate = wins / total * 100 if total > 0 else 0
+        color = "#26a69a" if rate >= 50 else "#ef5350"
+        self.lbl_track_summary.setText(f"W:{wins} L:{losses} F:{flats} ({rate:.0f}%)")
+        self.lbl_track_summary.setStyleSheet(f"color:{color};")
+
+    def _update_history_display(self):
+        """Refresh the History tab with all tracked predictions."""
+        lines = []
+        lines.append(f"{'TIME':<10} {'SIG':<5} {'GRADE':<6} {'ENTRY':>8} {'EXIT':>8} {'P&L':>7} {'RESULT':<7}")
+        lines.append("-" * 60)
+        for pred in reversed(self.prediction_history):
+            t = pred["time"]
+            sig = pred["signal"]
+            grade = pred["grade"]
+            entry = f"${pred['entry_price']:.2f}"
+            ex = f"${pred['exit_price']:.2f}" if pred["exit_price"] else "--"
+            pnl = f"{pred['pnl_pct']:+.3f}%" if pred["pnl_pct"] is not None else "--"
+            result = pred["result"] or "PENDING"
+            if result == "WIN":
+                marker = "[OK]"
+            elif result == "LOSS":
+                marker = "[X]"
+            elif result == "FLAT":
+                marker = "[~]"
+            else:
+                marker = "[...]"
+            lines.append(f"{t:<10} {sig:<5} {grade:<6} {entry:>8} {ex:>8} {pnl:>7} {marker} {result}")
+
+        # Summary at bottom
+        resolved = [p for p in self.prediction_history if p["result"] in ("WIN", "LOSS", "FLAT")]
+        if resolved:
+            wins = sum(1 for p in resolved if p["result"] == "WIN")
+            losses = sum(1 for p in resolved if p["result"] == "LOSS")
+            total = len(resolved)
+            avg_pnl = sum(p["pnl_pct"] for p in resolved) / total
+            best = max(resolved, key=lambda p: p["pnl_pct"])
+            worst = min(resolved, key=lambda p: p["pnl_pct"])
+            lines.append("")
+            lines.append(f"Total: {total}  |  Wins: {wins}  |  Rate: {wins/total*100:.0f}%  |  Avg P&L: {avg_pnl:+.3f}%")
+            lines.append(f"Best: {best['pnl_pct']:+.3f}% ({best['grade']} {best['signal']})  |  Worst: {worst['pnl_pct']:+.3f}% ({worst['grade']} {worst['signal']})")
+
+            # Grade breakdown
+            grade_stats = {}
+            for p in resolved:
+                g = p["grade"]
+                if g not in grade_stats:
+                    grade_stats[g] = {"wins": 0, "total": 0, "pnl_sum": 0}
+                grade_stats[g]["total"] += 1
+                grade_stats[g]["pnl_sum"] += p["pnl_pct"]
+                if p["result"] == "WIN":
+                    grade_stats[g]["wins"] += 1
+            lines.append("")
+            lines.append("By Grade:")
+            for g in ["A+", "A", "B", "C", "D", "F"]:
+                if g in grade_stats:
+                    gs = grade_stats[g]
+                    r = gs["wins"] / gs["total"] * 100
+                    avg = gs["pnl_sum"] / gs["total"]
+                    lines.append(f"  {g}: {gs['wins']}/{gs['total']} ({r:.0f}%) avg P&L {avg:+.3f}%")
+
+            # Signal direction breakdown
+            call_resolved = [p for p in resolved if p["signal"] == "CALL"]
+            put_resolved = [p for p in resolved if p["signal"] == "PUT"]
+            if call_resolved and put_resolved:
+                lines.append("")
+                call_wins = sum(1 for p in call_resolved if p["result"] == "WIN")
+                put_wins = sum(1 for p in put_resolved if p["result"] == "WIN")
+                lines.append(f"CALL: {call_wins}/{len(call_resolved)} ({call_wins/len(call_resolved)*100:.0f}%)  |  "
+                             f"PUT: {put_wins}/{len(put_resolved)} ({put_wins/len(put_resolved)*100:.0f}%)")
+
+        self.history_text.setPlainText("\n".join(lines))
+
+    # -------------------------------------------------------------------
+    # Open/Close swing predictor
+    # -------------------------------------------------------------------
+    def _fetch_swing_prediction(self):
+        """Fetch historical data in a background thread."""
+        self._swing_worker = SwingFetchWorker()
+        self._swing_worker.finished.connect(self._process_swing_data)
+        self._swing_worker.start()
+
+    def _process_swing_data(self, df):
+        """Process swing prediction data (called from worker thread signal)."""
+        try:
+            if df is None or df.empty or len(df) < 20:
+                self.lbl_swing.setText("Insufficient historical data")
+                return
+
+            # Calculate daily moves
+            df["OC_pct"] = (df["Close"] - df["Open"]) / df["Open"] * 100
+            df["range_pct"] = (df["High"] - df["Low"]) / df["Open"] * 100
+            df["gap_pct"] = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1) * 100
+
+            et = now_et()
+            today_dow = et.weekday()
+
+            # Day-of-week stats
+            df["dow"] = df.index.dayofweek
+            dow_data = df[df["dow"] == today_dow]["OC_pct"]
+            dow_names = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+            dow_name = dow_names[today_dow] if today_dow < 5 else "?"
+
+            # Recent trend (last 5 days)
+            recent = df["OC_pct"].iloc[-5:]
+            recent_avg = recent.mean()
+            recent_up = sum(1 for x in recent if x > 0)
+
+            # Overall stats
+            last_20 = df.iloc[-20:]
+            avg_oc = last_20["OC_pct"].mean()
+            avg_range = last_20["range_pct"].mean()
+            up_days = sum(1 for x in last_20["OC_pct"] if x > 0)
+            down_days = 20 - up_days
+
+            # Predict direction
+            signals_up = 0
+            signals_dn = 0
+            reasons = []
+
+            # 1. Day-of-week bias
+            if len(dow_data) >= 4:
+                dow_avg = dow_data.mean()
+                dow_up = sum(1 for x in dow_data if x > 0)
+                dow_rate = dow_up / len(dow_data) * 100
+                if dow_avg > 0.05:
+                    signals_up += 1
+                    reasons.append(f"{dow_name}s tend up: avg {dow_avg:+.2f}% ({dow_rate:.0f}% green)")
+                elif dow_avg < -0.05:
+                    signals_dn += 1
+                    reasons.append(f"{dow_name}s tend down: avg {dow_avg:+.2f}% ({100-dow_rate:.0f}% red)")
+                else:
+                    reasons.append(f"{dow_name}s neutral: avg {dow_avg:+.2f}%")
+
+            # 2. Recent momentum
+            if recent_up >= 4:
+                signals_up += 1
+                reasons.append(f"Recent momentum: {recent_up}/5 up days (avg {recent_avg:+.2f}%)")
+            elif recent_up <= 1:
+                signals_dn += 1
+                reasons.append(f"Recent weakness: {recent_up}/5 up days (avg {recent_avg:+.2f}%)")
+            else:
+                reasons.append(f"Mixed recent: {recent_up}/5 up (avg {recent_avg:+.2f}%)")
+
+            # 3. 20-day trend
+            if avg_oc > 0.05:
+                signals_up += 1
+                reasons.append(f"20-day bullish bias: avg {avg_oc:+.2f}%, {up_days}/{20} up")
+            elif avg_oc < -0.05:
+                signals_dn += 1
+                reasons.append(f"20-day bearish bias: avg {avg_oc:+.2f}%, {down_days}/{20} down")
+
+            # 4. Mean reversion after big moves
+            yesterday_oc = df["OC_pct"].iloc[-1]
+            if abs(yesterday_oc) > avg_range * 0.6:
+                if yesterday_oc > 0:
+                    signals_dn += 1
+                    reasons.append(f"Yesterday big up ({yesterday_oc:+.2f}%) -> reversion bias")
+                else:
+                    signals_up += 1
+                    reasons.append(f"Yesterday big down ({yesterday_oc:+.2f}%) -> bounce bias")
+
+            # 5. Consecutive day streaks (3+ days same direction often reverses)
+            last_3 = df["OC_pct"].iloc[-3:]
+            if all(x > 0 for x in last_3):
+                signals_dn += 1
+                reasons.append(f"3+ green days in a row -> mean reversion risk")
+            elif all(x < 0 for x in last_3):
+                signals_up += 1
+                reasons.append(f"3+ red days in a row -> bounce is overdue")
+
+            # 6. Range contraction/expansion (tight range = breakout coming)
+            last_5_range = df["range_pct"].iloc[-5:].mean()
+            if last_5_range < avg_range * 0.6:
+                reasons.append(f"[!] Range contracting ({last_5_range:.2f}% vs avg {avg_range:.2f}%) -> breakout likely")
+            elif last_5_range > avg_range * 1.4:
+                reasons.append(f"Range expanding ({last_5_range:.2f}%) -> volatile, expect continuation")
+
+            # 7. Gap analysis (overnight gap tends to fill)
+            if not pd.isna(df["gap_pct"].iloc[-1]):
+                gap = df["gap_pct"].iloc[-1]
+                if gap > 0.15:
+                    signals_dn += 1
+                    reasons.append(f"Gap up {gap:+.2f}% -> gap fill bias (bearish intraday)")
+                elif gap < -0.15:
+                    signals_up += 1
+                    reasons.append(f"Gap down {gap:+.2f}% -> gap fill bias (bullish intraday)")
+
+            # Build prediction
+            if signals_up > signals_dn:
+                direction = "UP"
+                color = "#26a69a"
+                confidence = min(90, 50 + (signals_up - signals_dn) * 15)
+            elif signals_dn > signals_up:
+                direction = "DOWN"
+                color = "#ef5350"
+                confidence = min(90, 50 + (signals_dn - signals_up) * 15)
+            else:
+                direction = "NEUTRAL"
+                color = "#ffab00"
+                confidence = 50
+
+            lines = [
+                f"Prediction: {direction} ({confidence}% confidence)",
+                f"Avg daily range: {avg_range:.2f}%  |  20-day avg O->C: {avg_oc:+.2f}%",
+                "",
+            ] + [f"  {r}" for r in reasons]
+
+            self.lbl_swing.setText("\n".join(lines))
+            self.lbl_swing.setStyleSheet(f"color:{color};")
+            self.swing_prediction = {"direction": direction, "confidence": confidence}
+
+        except Exception as e:
+            self.lbl_swing.setText(f"Could not load historical data: {e}")
+            self.lbl_swing.setStyleSheet("color:#888;")
 
 
 # ---------------------------------------------------------------------------
@@ -1960,23 +3557,21 @@ class OptionsValueScanner(QMainWindow):
         self.lbl_status.setText("Scanning...")
         self.lbl_status.setStyleSheet("color:#ffab00;")
         self.btn_refresh.setEnabled(False)
-        QApplication.processEvents()
+        # Use a timer to allow UI to update before blocking scan
+        QTimer.singleShot(50, self._do_scan)
+
+    def _do_scan(self):
 
         try:
             # Get current SPY price
-            df = yf.download("SPY", period="1d", interval="1m",
-                             progress=False, auto_adjust=True, multi_level_index=False)
-            if df is None or df.empty:
-                df = yf.download("SPY", period="5d", interval="1d",
-                                 progress=False, auto_adjust=True, multi_level_index=False)
-            if df is None or df.empty:
+            df = yf_download_safe("SPY", period="1d", interval="1m")
+            if df is None:
+                df = yf_download_safe("SPY", period="5d", interval="1d")
+            if df is None:
                 self.lbl_status.setText("[!] Could not get SPY price")
                 self.lbl_status.setStyleSheet("color:#ef5350;")
                 self.btn_refresh.setEnabled(True)
                 return
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
             spy_price = float(df["Close"].iloc[-1])
 
             results = scan_options_value(spy_price)
@@ -2111,6 +3706,14 @@ def main():
     app = QApplication(sys.argv)
     win = SPYderScalpApp()
     win.show()
+    # Force the canvas to realize its size and paint
+    win.candle_chart.setVisible(True)
+    win.candle_chart.updateGeometry()
+    win.candle_chart.draw_idle()
+    # Auto-start monitoring on launch
+    QTimer.singleShot(500, win.start_monitoring)
+    # Fetch swing prediction after a short delay (non-blocking)
+    QTimer.singleShot(2000, win._fetch_swing_prediction)
     sys.exit(app.exec_())
 
 

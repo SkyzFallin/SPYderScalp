@@ -91,7 +91,22 @@ THEME = {
 # Settings persistence
 # ---------------------------------------------------------------------------
 
-SETTINGS_FILE = Path.home() / ".spyderscalp_settings.json"
+def _app_data_dir():
+    """Platform-appropriate directory for app data (settings, history, logs)."""
+    if platform.system() == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home()))
+    elif platform.system() == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    d = base / "SPYderScalp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+APP_DATA_DIR = _app_data_dir()
+SETTINGS_FILE = APP_DATA_DIR / "settings.json"
+HISTORY_FILE = APP_DATA_DIR / "prediction_history.json"
+CRASH_LOG = APP_DATA_DIR / "crash.log"
 
 
 def load_settings():
@@ -102,6 +117,12 @@ def load_settings():
         "splitter_sizes": [820, 540],
     }
     try:
+        # Migrate old settings file from home directory if it exists
+        old_file = Path.home() / ".spyderscalp_settings.json"
+        if old_file.exists() and not SETTINGS_FILE.exists():
+            import shutil
+            shutil.move(str(old_file), str(SETTINGS_FILE))
+
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r") as f:
                 defaults.update(json.load(f))
@@ -114,6 +135,45 @@ def save_settings(settings):
     try:
         with open(SETTINGS_FILE, "w") as f:
             json.dump(settings, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_prediction_history():
+    """Load prediction history from disk."""
+    try:
+        if HISTORY_FILE.exists():
+            with open(HISTORY_FILE, "r") as f:
+                data = json.load(f)
+            # Restore datetime objects from ISO strings
+            for pred in data:
+                if isinstance(pred.get("timestamp"), str):
+                    pred["timestamp"] = datetime.fromisoformat(pred["timestamp"])
+                if isinstance(pred.get("check_time"), str):
+                    pred["check_time"] = datetime.fromisoformat(pred["check_time"])
+            # Cap at 500 entries on load
+            return data[-500:] if len(data) > 500 else data
+    except Exception:
+        pass
+    return []
+
+
+def _save_prediction_history(history):
+    """Save prediction history to disk."""
+    try:
+        # Cap at 500 entries before saving
+        to_save = history[-500:] if len(history) > 500 else history
+        # Convert datetime objects to ISO strings for JSON
+        serializable = []
+        for pred in to_save:
+            p = dict(pred)
+            if isinstance(p.get("timestamp"), datetime):
+                p["timestamp"] = p["timestamp"].isoformat()
+            if isinstance(p.get("check_time"), datetime):
+                p["check_time"] = p["check_time"].isoformat()
+            serializable.append(p)
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(serializable, f, indent=2)
     except Exception:
         pass
 
@@ -1685,12 +1745,16 @@ class SPYderScalpApp(QMainWindow):
         self.consecutive_same_signal = 0  # Track repeated signals for confirmation
         self.is_monitoring = False
         self.platform = platform.system()
-        self.prediction_history = []  # list of dicts tracking each signal
+        self.prediction_history = _load_prediction_history()  # persisted across sessions
         self.swing_prediction = None  # open/close swing forecast
         self.session_pnl = []  # session P&L entries
         self._settings = load_settings()
         self._build_ui()
         self._apply_saved_settings()
+        # Refresh history display if we loaded data from a previous session
+        if self.prediction_history:
+            self._update_history_display()
+            self._update_track_summary()
         self.monitor_timer = QTimer()
         self.monitor_timer.timeout.connect(self.check_signals)
         # Timer to check prediction outcomes every 30 seconds
@@ -2931,6 +2995,7 @@ class SPYderScalpApp(QMainWindow):
 
     def _clear_history(self):
         self.prediction_history.clear()
+        _save_prediction_history(self.prediction_history)
         self.history_text.setPlainText("History cleared.")
         self._update_track_summary()
         self._log("[OK] Prediction history cleared")
@@ -2975,6 +3040,7 @@ class SPYderScalpApp(QMainWindow):
             "pnl_pct": None,
         }
         self.prediction_history.append(pred)
+        _save_prediction_history(self.prediction_history)
         self._update_history_display()
         return pred
 
@@ -3034,6 +3100,7 @@ class SPYderScalpApp(QMainWindow):
 
         self._update_history_display()
         self._update_track_summary()
+        _save_prediction_history(self.prediction_history)
 
     def _update_track_summary(self):
         """Update the win/loss summary in the status bar."""
@@ -3718,4 +3785,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        # Write crash info to log file so silent failures are debuggable
+        try:
+            with open(CRASH_LOG, "a") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"CRASH at {datetime.now().isoformat()}\n")
+                f.write(traceback.format_exc())
+                f.write(f"{'='*60}\n")
+        except Exception:
+            pass
+        raise

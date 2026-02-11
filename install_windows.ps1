@@ -1,9 +1,13 @@
 # install_windows.ps1
-# Windows 11 x64 installer for SPY Signal App
+# SPYderScalp - Windows PowerShell Installer (Alternative)
 # - Installs Python (via winget) if missing
 # - Creates venv .venv
-# - Installs dependencies
+# - Installs dependencies from requirements.txt
 # - Creates a helper run script
+#
+# Note: SPYderScalp.bat handles all of this automatically.
+#       Use this script only if you prefer PowerShell or need
+#       winget-based Python installation.
 
 $ErrorActionPreference = "Stop"
 
@@ -28,7 +32,6 @@ if (-not $winget) {
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 if (-not $pythonCmd) {
     Write-Info "Python not found. Installing Python 3.x via winget..."
-    # python.python3 typically installs the latest stable Python 3
     winget install --id Python.Python.3 --source winget --accept-package-agreements --accept-source-agreements
     Write-Ok "Python install attempted. Re-checking python..."
     $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
@@ -37,6 +40,17 @@ if (-not $pythonCmd) {
     }
 } else {
     Write-Ok "Python found: $($pythonCmd.Source)"
+}
+
+# --- Check Python version >= 3.9 ---
+$pyVersion = python --version 2>&1
+if ($pyVersion -match '(\d+)\.(\d+)') {
+    $major = [int]$Matches[1]
+    $minor = [int]$Matches[2]
+    if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 9)) {
+        throw "Python 3.9+ required but found $pyVersion. Please install a newer version."
+    }
+    Write-Ok "Python version OK: $pyVersion"
 }
 
 # --- Upgrade pip tooling ---
@@ -62,17 +76,17 @@ if (-not (Test-Path $activate)) {
 Write-Info "Activating venv..."
 . $activate
 
-# --- Install dependencies ---
-Write-Info "Installing Python dependencies..."
-pip install --upgrade yfinance pandas numpy PyQt5 matplotlib plyer pytz
+# --- Install dependencies from requirements.txt ---
+$reqPath = Join-Path $PSScriptRoot "requirements.txt"
+if (Test-Path $reqPath) {
+    Write-Info "Installing Python dependencies from requirements.txt..."
+    pip install --upgrade -r $reqPath
+} else {
+    Write-Info "Installing Python dependencies..."
+    pip install --upgrade yfinance pandas numpy PyQt5 matplotlib plyer pytz
+}
 
 Write-Ok "Dependencies installed."
-
-# --- (Optional) Create requirements.txt for reproducibility ---
-$reqPath = Join-Path $PSScriptRoot "requirements.txt"
-Write-Info "Freezing installed packages to requirements.txt..."
-pip freeze | Out-File -Encoding UTF8 $reqPath
-Write-Ok "Wrote requirements.txt"
 
 # --- Create a run helper script ---
 $runScript = Join-Path $PSScriptRoot "run_app.ps1"
@@ -87,3 +101,4 @@ Write-Ok "Created run helper: run_app.ps1"
 Write-Host ""
 Write-Ok "Done."
 Write-Host "Next: Right-click run_app.ps1 -> 'Run with PowerShell' (or run: .\run_app.ps1)"
+Write-Host "      Or just double-click SPYderScalp.bat to launch."

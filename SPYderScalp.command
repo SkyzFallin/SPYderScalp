@@ -69,14 +69,22 @@ PY=".venv/bin/python"
 PIP=".venv/bin/pip"
 
 # --- Check if deps are installed ---
-if "$PY" -c "import PyQt5; import yfinance; import matplotlib; import plyer; import pytz" 2>/dev/null; then
+if "$PY" -c "import PyQt5; import yfinance; import matplotlib; import plyer; import pytz; import pandas; import numpy" 2>/dev/null; then
     ok "Dependencies OK"
 else
     info "Installing dependencies (this takes about a minute)..."
     "$PIP" install --upgrade pip >/dev/null 2>&1
-    "$PIP" install --no-cache-dir yfinance pandas numpy PyQt5 matplotlib plyer pytz || {
-        fail "Package install failed. Check your internet connection."
-    }
+
+    # Use requirements.txt if available, otherwise fall back to package list
+    if [ -f "requirements.txt" ]; then
+        "$PIP" install --no-cache-dir -r requirements.txt || {
+            fail "Package install failed. Check your internet connection."
+        }
+    else
+        "$PIP" install --no-cache-dir yfinance pandas numpy PyQt5 matplotlib plyer pytz || {
+            fail "Package install failed. Check your internet connection."
+        }
+    fi
     ok "Dependencies installed"
 fi
 
@@ -84,8 +92,9 @@ fi
 ok "Launching SPYderScalp..."
 echo ""
 
-# Run in background and close the terminal window
-nohup "$PY" "$(pwd)/spyer.py" >/dev/null 2>&1 &
+# Run in background; log stderr to crash.log for debugging
+LOGFILE="$(pwd)/crash.log"
+nohup "$PY" "$(pwd)/spyer.py" >/dev/null 2>>"$LOGFILE" &
 
 # Give the app a moment to start, then close Terminal
 sleep 1

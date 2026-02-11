@@ -1769,6 +1769,12 @@ class SPYderScalpApp(QMainWindow):
         self.clock_timer = QTimer()
         self.clock_timer.timeout.connect(self._tick_clock)
         self.clock_timer.start(1000)
+        # Populate calendar immediately so it doesn't just say "Scanning..."
+        try:
+            event_ctx = get_event_context(now_et())
+            self._update_events(event_ctx)
+        except Exception:
+            pass
 
     def _build_ui(self):
         root = QWidget()
@@ -2033,19 +2039,23 @@ class SPYderScalpApp(QMainWindow):
         info_row.addWidget(self.lbl_dte_detail)
         right_layout.addLayout(info_row)
 
-        # --- Swing prediction bar ---
+        # --- Swing prediction section (expanded) ---
         swing_box = QGroupBox("Open/Close Swing Forecast")
-        swing_box.setFont(QFont("Arial", 8, QFont.Bold))
-        swing_box.setStyleSheet("QGroupBox{color:#aaa;border:1px solid #333;border-radius:3px;margin-top:6px;padding-top:10px;}")
+        swing_box.setFont(QFont("Arial", 9, QFont.Bold))
+        swing_box.setStyleSheet("QGroupBox{color:#aaa;border:1px solid #333;border-radius:3px;margin-top:6px;padding-top:12px;}")
         swing_lay = QVBoxLayout(swing_box)
-        swing_lay.setContentsMargins(4, 2, 4, 2)
-        swing_lay.setSpacing(1)
-        self.lbl_swing = QLabel("Loading historical data...")
-        self.lbl_swing.setFont(QFont("Consolas", 8))
-        self.lbl_swing.setStyleSheet("color:#ccc;")
-        self.lbl_swing.setWordWrap(True)
+        swing_lay.setContentsMargins(4, 4, 4, 4)
+        swing_lay.setSpacing(2)
+        self.lbl_swing = QTextEdit()
+        self.lbl_swing.setReadOnly(True)
+        self.lbl_swing.setFont(QFont("Consolas", 9))
+        self.lbl_swing.setStyleSheet("color:#111; background:#d8d8d8; border:none;")
+        self.lbl_swing.setPlainText("Loading historical data...")
         swing_lay.addWidget(self.lbl_swing)
-        right_layout.addWidget(swing_box)
+
+        # --- Splitter: forecast on top (bigger), tabs on bottom (smaller) ---
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.addWidget(swing_box)
 
         # --- Tabs ---
         self.tabs = QTabWidget()
@@ -2123,7 +2133,12 @@ class SPYderScalpApp(QMainWindow):
         log_layout.addWidget(self.log_text)
         self.tabs.addTab(tab_log, "Log")
 
-        right_layout.addWidget(self.tabs, stretch=1)
+        right_splitter.addWidget(self.tabs)
+        # Give forecast ~65% of vertical space, tabs ~35%
+        right_splitter.setSizes([400, 170])
+        right_splitter.setCollapsible(0, False)
+        right_splitter.setCollapsible(1, False)
+        right_layout.addWidget(right_splitter, stretch=1)
         splitter.addWidget(right_widget)
         splitter.setSizes([820, 540])
         splitter.setCollapsible(0, False)
@@ -3302,25 +3317,70 @@ class SPYderScalpApp(QMainWindow):
             # Build prediction
             if signals_up > signals_dn:
                 direction = "UP"
-                color = "#26a69a"
                 confidence = min(90, 50 + (signals_up - signals_dn) * 15)
             elif signals_dn > signals_up:
                 direction = "DOWN"
-                color = "#ef5350"
                 confidence = min(90, 50 + (signals_dn - signals_up) * 15)
             else:
                 direction = "NEUTRAL"
-                color = "#ffab00"
                 confidence = 50
 
-            lines = [
-                f"Prediction: {direction} ({confidence}% confidence)",
-                f"Avg daily range: {avg_range:.2f}%  |  20-day avg O->C: {avg_oc:+.2f}%",
-                "",
-            ] + [f"  {r}" for r in reasons]
+            # Direction arrow for header
+            dir_arrow = {"UP": "^", "DOWN": "v", "NEUTRAL": "-"}.get(direction, "?")
 
-            self.lbl_swing.setText("\n".join(lines))
-            self.lbl_swing.setStyleSheet(f"color:{color};")
+            # Day-of-week breakdown table
+            dow_table_lines = []
+            dow_names_all = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+            for i, dn in enumerate(dow_names_all):
+                dd = df[df["dow"] == i]["OC_pct"]
+                if len(dd) >= 2:
+                    d_avg = dd.mean()
+                    d_up = sum(1 for x in dd if x > 0)
+                    d_rate = d_up / len(dd) * 100
+                    marker = " <<" if i == today_dow else ""
+                    dow_table_lines.append(f"    {dn}:  avg {d_avg:+.2f}%  |  {d_rate:.0f}% green  ({len(dd)} samples){marker}")
+
+            # Last 5 days detail
+            last5_lines = []
+            for idx in range(-min(5, len(df)), 0):
+                row = df.iloc[idx]
+                d = df.index[idx]
+                oc = row["OC_pct"]
+                rng = row["range_pct"]
+                tag = "+" if oc > 0 else "-" if oc < 0 else "="
+                try:
+                    day_str = d.strftime("%a %m/%d")
+                except Exception:
+                    day_str = str(d)[:10]
+                last5_lines.append(f"    {day_str}  [{tag}]  O->C: {oc:+.2f}%  range: {rng:.2f}%")
+
+            # Volatility stats
+            vol_20 = last_20["OC_pct"].std()
+            max_up = last_20["OC_pct"].max()
+            max_dn = last_20["OC_pct"].min()
+
+            lines = [
+                f"  [{dir_arrow}] Prediction: {direction}  ({confidence}% confidence)",
+                f"",
+                f"  -- 20-Day Overview --",
+                f"    Avg O->C:     {avg_oc:+.2f}%",
+                f"    Avg range:    {avg_range:.2f}%",
+                f"    Volatility:   {vol_20:.2f}% std dev",
+                f"    Up/Down:      {up_days} up / {down_days} down",
+                f"    Best day:     {max_up:+.2f}%",
+                f"    Worst day:    {max_dn:+.2f}%",
+                f"",
+                f"  -- Day-of-Week Breakdown --",
+            ] + dow_table_lines + [
+                f"",
+                f"  -- Last 5 Sessions --",
+            ] + last5_lines + [
+                f"",
+                f"  -- Signals --",
+            ] + [f"    {r}" for r in reasons]
+
+            self.lbl_swing.setPlainText("\n".join(lines))
+            self.lbl_swing.setStyleSheet("color:#111; background:#d8d8d8; border:none;")
             self.swing_prediction = {"direction": direction, "confidence": confidence}
 
         except Exception as e:

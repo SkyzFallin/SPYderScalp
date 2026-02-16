@@ -199,7 +199,7 @@ Built-in calendar of every major US economic event for 2025-2026. Populated imme
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SPYderScalp.git
+git clone https://github.com/SkyzFallin/SPYderScalp.git
 cd SPYderScalp
 pip install -r requirements.txt
 ```
@@ -230,7 +230,7 @@ Double-click **`SPYderScalp.command`** -- same idea as the Windows launcher:
 Or manually:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SPYderScalp.git
+git clone https://github.com/SkyzFallin/SPYderScalp.git
 cd SPYderScalp
 python3 -m venv .venv
 source .venv/bin/activate
